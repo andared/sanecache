@@ -14,7 +14,7 @@ While the major version is 0, the public API may change in any release.
 - A coarse clock, to take the wall-clock read off the lookup path.
 - Comparison benchmarks against other caches, in a separate module.
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-09-06
 
 First cut.
 
@@ -27,3 +27,6 @@ First cut.
 - Optional sharding via `Shards`.
 - Built-in counters via `Stats`, and an `OnEvict` callback carrying a reason.
 - `ErrTooLarge` from `Set` for values that can never fit.
+
+[Unreleased]: https://github.com/andared/sanecache/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/andared/sanecache/releases/tag/v0.1.0
