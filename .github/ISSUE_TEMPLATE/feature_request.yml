@@ -1,0 +1,28 @@
+name: Feature request
+description: Propose something the library should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What are you trying to do that is awkward today? Describe the situation
+        rather than the API you have in mind — the fix is often a different one.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: >
+        Including other caches. If one of them already does this well, that is
+        useful to know: this library does not aim to cover everything.
+    validations:
+      required: false

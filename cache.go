@@ -24,6 +24,7 @@ import (
 // Status is the outcome of a lookup.
 type Status uint8
 
+// The outcomes a lookup can report.
 const (
 	StatusMiss     Status = iota // the cache knows nothing about this key
 	StatusHit                    // a value was cached
@@ -68,6 +69,7 @@ func (p Policy) String() string {
 // calls do not report a reason.
 type EvictReason uint8
 
+// The reasons an entry can leave the cache on its own.
 const (
 	ReasonEvicted  EvictReason = iota // dropped to stay inside the budget
 	ReasonExpired                     // its TTL ran out

@@ -1,0 +1,27 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - gocritic
+    - misspell
+    - revive
+    - unconvert
+    - usestdlibvars
+  settings:
+    revive:
+      rules:
+        - name: exported
+          # A public library's exported surface is its documentation.
+          arguments: [checkPrivateReceivers]
+  exclusions:
+    rules:
+      # Jitter spreads expiry times; it is not a security decision, and a
+      # cryptographic source here would cost more than the whole lookup.
+      - path: cache\.go
+        text: "math/rand"
+
+issues:
+  # A repository this size should show every finding, not a sample of three.
+  max-issues-per-linter: 0
+  max-same-issues: 0

@@ -1,5 +1,9 @@
 # sanecache
 
+[![CI](https://github.com/andared/sanecache/actions/workflows/ci.yml/badge.svg)](https://github.com/andared/sanecache/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/andared/sanecache.svg)](https://pkg.go.dev/github.com/andared/sanecache)
+[![Go Report Card](https://goreportcard.com/badge/github.com/andared/sanecache)](https://goreportcard.com/report/github.com/andared/sanecache)
+
 A small in-memory cache for Go that aims to be **predictable before it is fast**.
 
 There is no shortage of Go caches, and several of them are excellent. This one exists
@@ -177,5 +181,8 @@ v0.1. The API above is what exists and is tested; expect it to move before v1.
 On the list, in rough order: a loader with single-flight so a cold key is fetched once
 rather than once per concurrent caller; typed views over a shared byte budget, for when one
 budget holds several value types; and a coarse clock to take that 29 ns off the read path.
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for what this
+library optimises for before proposing a change.
 
 MIT licensed.

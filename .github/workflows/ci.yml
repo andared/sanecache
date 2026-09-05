@@ -5,10 +5,14 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         # The go.mod minimum and the current release: the minimum is a promise,
         # so it gets tested rather than assumed.
@@ -22,5 +26,33 @@ jobs:
           cache: false
       - run: go vet ./...
       - run: go test -race -count=2 ./...
+
+  # The cache is pure Go, but expiry leans on the wall clock and eviction on map
+  # iteration order, so the other platforms are worth a run.
+  platforms:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - run: go test -race -count=1 ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13.2
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }

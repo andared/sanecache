@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # Actions go stale quietly: the first CI run here was already two major
+  # versions behind and only said so as a deprecation warning.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

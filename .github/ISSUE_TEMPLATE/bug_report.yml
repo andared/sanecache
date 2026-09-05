@@ -1,0 +1,35 @@
+name: Bug report
+description: Something behaves differently from what the documentation says
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you observed, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproducer
+      description: >
+        Ideally a failing test or a small main(). Include the Options you built
+        the cache with — most behaviour here is a consequence of those.
+      render: go
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: sanecache version
+      placeholder: v0.1.0, or a commit SHA
+    validations:
+      required: true
+  - type: input
+    id: go
+    attributes:
+      label: Go version and platform
+      placeholder: go version
+    validations:
+      required: true

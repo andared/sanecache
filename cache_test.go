@@ -274,7 +274,9 @@ func TestOnEvictReasons(t *testing.T) {
 
 	// Explicit removal is the caller's own doing and is not reported.
 	before := len(seen[ReasonEvicted]) + len(seen[ReasonExpired]) + len(seen[ReasonReplaced])
-	c.Set("z", 1)
+	if err := c.Set("z", 1); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
 	c.Delete("z")
 	c.Clear()
 	after := len(seen[ReasonEvicted]) + len(seen[ReasonExpired]) + len(seen[ReasonReplaced])
@@ -287,8 +289,12 @@ func TestStats(t *testing.T) {
 	c := New(Options[string, int]{TTL: time.Minute, NegativeTTL: time.Minute})
 	defer c.Close()
 
-	c.Set("a", 1)
-	c.SetNegative("b")
+	if err := c.Set("a", 1); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := c.SetNegative("b"); err != nil {
+		t.Fatalf("SetNegative: %v", err)
+	}
 
 	c.Get("a")    // hit
 	c.Get("a")    // hit
@@ -432,13 +438,15 @@ func TestConcurrentUse(t *testing.T) {
 					defer wg.Done()
 					for i := range 2000 {
 						k := (g*2000 + i) % 900
+						// Errors are part of what is being exercised here: a
+						// tight budget makes ErrTooLarge an ordinary outcome.
 						switch i % 4 {
 						case 0:
-							c.Set(k, i)
+							_ = c.Set(k, i)
 						case 1:
 							c.Lookup(k)
 						case 2:
-							c.SetNegative(k)
+							_ = c.SetNegative(k)
 						default:
 							c.Delete(k)
 						}

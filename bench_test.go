@@ -18,7 +18,8 @@ func benchCache(shards int, policy Policy) *Cache[int, int] {
 		Policy:   policy,
 	})
 	for i := range benchKeys {
-		c.Set(i, i)
+		// The budget is sized to fit exactly these keys, so Set cannot fail.
+		_ = c.Set(i, i)
 	}
 
 	return c
@@ -57,7 +58,7 @@ func BenchmarkSet(b *testing.B) {
 			b.RunParallel(func(pb *testing.PB) {
 				i := 0
 				for pb.Next() {
-					c.Set(i%benchKeys, i)
+					_ = c.Set(i%benchKeys, i)
 					i++
 				}
 			})
@@ -78,7 +79,7 @@ func BenchmarkMixed(b *testing.B) {
 				i := 0
 				for pb.Next() {
 					if i%10 == 0 {
-						c.Set(i%benchKeys, i)
+						_ = c.Set(i%benchKeys, i)
 					} else {
 						c.Get(i % benchKeys)
 					}
