@@ -131,9 +131,15 @@ storm; caching the error on top of that would turn a blip into an outage that ou
 
 The loader runs on a goroutine of the cache's own, which is what makes the two points above
 possible. If it panics, the panic is carried to the callers rather than taking the process
-down, and it arrives with the stack of where it actually happened. A load with no caller
-left is cancelled, and a load that needs a deadline of its own should set one inside the
-loader, where the right number is known.
+down, and it arrives with the stack of where it actually happened. A load that needs a
+deadline of its own should set one inside the loader, where the right number is known.
+
+A load with no caller left is cancelled — but a loader that does not watch its context
+finishes anyway, and its value is cached even then. That is deliberate: when callers time
+out faster than the upstream answers, throwing those values away means the cache never warms
+and every request keeps timing out. The price is the narrow case where such a load lands
+after a later one and puts back a value read before it, with the TTL starting again. A
+loader that honours cancellation never reaches it.
 
 ## Several value types under one budget
 

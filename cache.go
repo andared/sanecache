@@ -134,6 +134,13 @@ type Options[K comparable, V any] struct {
 	// that started the load, but it is cancelled only once every caller waiting
 	// for the result has given up. A loader must not call GetOrLoad on the same
 	// cache and key, which would wait for itself.
+	//
+	// A load that nobody is waiting for any more is cancelled, but a loader that
+	// does not watch its context finishes regardless, and its value is cached
+	// even so. That is what keeps a cache warming when callers time out faster
+	// than the upstream answers; the price is that such a load can land after a
+	// later one and put back a value read before it, with the TTL starting over.
+	// A loader that honours cancellation never gets there.
 	Loader func(ctx context.Context, key K) (V, error)
 
 	// Shards splits the cache into independently locked parts, rounded up to a
@@ -547,8 +554,13 @@ func (c *core[K, V]) clockLoop(granularity time.Duration, stop <-chan struct{}) 
 
 	for {
 		select {
-		case now := <-t.C:
-			c.coarse.Store(now.UnixNano())
+		case <-t.C:
+			// The clock is read here rather than taken from the tick. A tick
+			// carries the time it fired, which after a pause or a busy scheduler
+			// can be several intervals old — and publishing that would make
+			// expiry lag by the delay on top of the granularity, which is more
+			// than this option promises.
+			c.coarse.Store(time.Now().UnixNano())
 		case <-stop:
 			return
 		}

@@ -129,21 +129,24 @@ func (c *core[K, V]) run(ctx context.Context, g *flightGroup[K, V], s *shard[K, 
 	// The loader does not run on a caller's goroutine, so a panic in it would
 	// take the process down instead of the request that caused it. Carry it to
 	// the callers, who can recover from it as they would from any other call.
+	// Counted from the deferred path so that a load that panicked is counted
+	// too: a service that recovers panics per request would otherwise see a
+	// loader failing every call and a cache reporting no loads at all.
 	defer func() {
 		if r := recover(); r != nil {
 			cl.pan = &loaderPanic{value: r, stack: debug.Stack()}
+		}
+		if c.countStats {
+			s.counters.loads.Add(1)
+			if cl.err != nil || cl.pan != nil {
+				s.counters.loadErrors.Add(1)
+			}
 		}
 		g.finish(key, cl)
 	}()
 
 	v, err := c.loader(ctx, key)
-
-	if c.countStats {
-		s.counters.loads.Add(1)
-		if err != nil {
-			s.counters.loadErrors.Add(1)
-		}
-	}
+	cl.val, cl.err = v, err
 
 	// Cached before the waiters are released, so that a caller who looks the key
 	// up again straight away finds it, and a caller arriving a moment later does
@@ -156,8 +159,6 @@ func (c *core[K, V]) run(ctx context.Context, g *flightGroup[K, V], s *shard[K, 
 		// simply does not remember the answer.
 		_ = c.setNegative(key, c.negativeTTL)
 	}
-
-	cl.val, cl.err = v, err
 }
 
 // wait blocks until the load finishes or ctx is done, whichever comes first.

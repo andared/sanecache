@@ -477,6 +477,13 @@ func TestGetOrLoadCarriesAPanicToTheCaller(t *testing.T) {
 	if v, err := c.GetOrLoad(context.Background(), "k"); err != nil || v != 4 {
 		t.Fatalf("GetOrLoad after a panic = %v, %v; want 4, nil", v, err)
 	}
+
+	// A load that panicked is still a load that failed. Counting it only on the
+	// way out through a return would leave a service that recovers panics per
+	// request with a loader failing every call and a cache reporting nothing.
+	if st := c.Stats(); st.Loads != 2 || st.LoadErrors != 1 {
+		t.Fatalf("loads/errors = %d/%d; want 2/1", st.Loads, st.LoadErrors)
+	}
 }
 
 func TestGetOrLoadUnderConcurrency(t *testing.T) {
