@@ -22,6 +22,53 @@ Requires Go 1.24. No dependencies.
 
 ## Quick start
 
+Save this complete program as `main.go` in a new directory:
+
+```go
+package main
+
+import (
+    "fmt"
+    "time"
+
+    "github.com/andared/sanecache"
+)
+
+func main() {
+    c := sanecache.New(sanecache.Options[string, string]{
+        TTL:        time.Minute,
+        MaxEntries: 100,
+    })
+    defer c.Close()
+
+    if err := c.Set("greeting", "hello"); err != nil {
+        panic(err)
+    }
+
+    value, ok := c.Get("greeting")
+    fmt.Println(value, ok)
+}
+```
+
+With Go 1.24 or newer:
+
+```sh
+go mod init example.com/cache-demo
+go get github.com/andared/sanecache@v0.2.0
+go run .
+```
+
+Output: `hello true`.
+
+The same program is in [`examples/basic`](examples/basic). A second
+[runnable example](examples/README.md#caching-an-http-dependency) caches JSON responses from
+a local HTTP server, including HTTP 404 responses as negative entries. Both run in CI.
+
+## Applying a byte budget
+
+In an application with its own `Article` type and `fetch` function, account for each value's
+cost and handle missing records explicitly:
+
 ```go
 c := sanecache.New(sanecache.Options[string, *Article]{
     TTL:         10 * time.Minute,
@@ -84,7 +131,7 @@ callers arrive while it is running.
 
 ## Loading a cold key once
 
-The block in the quick start — look up, go to the upstream on a miss, remember the answer,
+The byte-budget example above — look up, go to the upstream on a miss, remember the answer,
 remember the absence of one — is the same in every service, and it has a hole in it: on a
 cold key, every concurrent request runs it at the same time.
 

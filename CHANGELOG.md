@@ -6,6 +6,11 @@ While the major version is 0, the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- Runnable basic-cache and HTTP-loader examples, checked by the existing test matrix,
+  plus a complete first program and installation commands in the README.
+
 ### Planned
 
 - A loader on views, so a typed view over a shared budget gets the same
