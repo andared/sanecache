@@ -11,6 +11,11 @@ While the major version is 0, the public API may change in any release.
 - A loader on views, so a typed view over a shared budget gets the same
   stampede protection the cache has.
 
+### Documentation
+
+- Clarified that `singleflight.Group` leaves context and cancellation policy to its caller,
+  and that BigCache and FreeCache reduce pointer scanning with on-heap byte buffers.
+
 ## [0.2.0] - 2026-09-06
 
 ### Added
