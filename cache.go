@@ -6,18 +6,21 @@
 // later. Budgets are expressed in bytes, because a limit on the number of entries
 // says nothing about the memory a process will use when entries are documents
 // rather than integers. "The upstream says this key does not exist" is a first
-// class answer rather than a marker smuggled inside the value type. And TTLs can
+// class answer rather than a marker smuggled inside the value type. TTLs can
 // carry jitter, so a batch of keys warmed by one request does not expire in
-// lockstep and stampede the upstream.
+// lockstep and stampede the upstream. And a cold key is fetched once rather than
+// once per concurrent caller asking for it.
 package sanecache
 
 import (
+	"context"
 	"fmt"
 	"hash/maphash"
 	"math/bits"
 	"math/rand/v2"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -118,6 +121,21 @@ type Options[K comparable, V any] struct {
 	// Measure it once rather than guessing (see the README).
 	Cost func(V) int64
 
+	// Loader fetches a value that is not cached. It is what GetOrLoad calls, and
+	// callers that ask for the same key while it is running share the one call
+	// instead of each starting their own.
+	//
+	// Returning an error that wraps ErrNotFound means the upstream has no such
+	// key: the answer is cached as a negative entry when NegativeTTL is set, and
+	// reported to every waiting caller. Any other error is passed through
+	// unchanged and is not cached.
+	//
+	// The context is not any one caller's: it carries the values of the caller
+	// that started the load, but it is cancelled only once every caller waiting
+	// for the result has given up. A loader must not call GetOrLoad on the same
+	// cache and key, which would wait for itself.
+	Loader func(ctx context.Context, key K) (V, error)
+
 	// Shards splits the cache into independently locked parts, rounded up to a
 	// power of two. Zero and one both mean a single lock. More shards reduce
 	// contention but make the budget approximate: each shard gets an equal slice
@@ -142,6 +160,16 @@ type Options[K comparable, V any] struct {
 	// happens only on lookup and on eviction.
 	DisableCleanup bool
 
+	// ClockGranularity trades TTL precision for lookup speed. Reading the wall
+	// clock is about half the cost of a lookup, so a cache under enough load for
+	// that to show up can have a background goroutine hold the time instead,
+	// refreshed this often. Expiry is then accurate to within one interval in
+	// either direction. Zero, the default, reads the clock on every operation.
+	//
+	// The goroutine is separate from the sweeper, so this works with
+	// DisableCleanup. Close stops it, and lookups go back to the wall clock.
+	ClockGranularity time.Duration
+
 	// OnEvict, if set, is called for every entry that leaves the cache without
 	// being explicitly deleted. Negative entries are reported with the zero
 	// value. It runs outside the shard lock, on the goroutine that caused the
@@ -158,9 +186,9 @@ type Cache[K comparable, V any] struct {
 	core *core[K, V]
 }
 
-// core holds everything the background sweeper touches. It is deliberately
+// core holds everything the background goroutines touch. It is deliberately
 // separate from Cache so that a Cache the caller has dropped can be collected
-// while the sweeper goroutine is still shutting down.
+// while those goroutines are still shutting down.
 type core[K comparable, V any] struct {
 	shards []*shard[K, V]
 	mask   uint64
@@ -173,8 +201,15 @@ type core[K comparable, V any] struct {
 	onEvict     func(K, V, EvictReason)
 	countStats  bool
 
-	stats counters
-	stop  *stopper
+	loader  func(context.Context, K) (V, error)
+	flights []*flightGroup[K, V]
+
+	// coarse holds the time a background goroutine last read, in unix
+	// nanoseconds, or nil when the cache reads the clock itself. Zero means the
+	// goroutine has stopped and the wall clock is authoritative again.
+	coarse *atomic.Int64
+
+	stop *stopper
 }
 
 // New builds a cache from o. It panics on options that cannot describe a working
@@ -192,6 +227,8 @@ func New[K comparable, V any](o Options[K, V]) *Cache[K, V] {
 		panic("sanecache: MaxBytes requires Cost; without it the budget would count entries, not bytes")
 	case o.TTL < 0 || o.NegativeTTL < 0:
 		panic("sanecache: TTL and NegativeTTL must not be negative")
+	case o.ClockGranularity < 0:
+		panic("sanecache: ClockGranularity must not be negative")
 	}
 
 	n := shardCount(o.Shards)
@@ -205,6 +242,7 @@ func New[K comparable, V any](o Options[K, V]) *Cache[K, V] {
 		cost:        o.Cost,
 		onEvict:     o.OnEvict,
 		countStats:  !o.DisableStats,
+		loader:      o.Loader,
 	}
 
 	perBytes := divideBudget(o.MaxBytes, int64(n))
@@ -212,16 +250,34 @@ func New[K comparable, V any](o Options[K, V]) *Cache[K, V] {
 	for i := range cr.shards {
 		cr.shards[i] = newShard[K, V](perBytes, perEntries, o.Policy)
 	}
+	if o.Loader != nil {
+		cr.flights = make([]*flightGroup[K, V], n)
+		for i := range cr.flights {
+			cr.flights[i] = newFlightGroup[K, V]()
+		}
+	}
+	if o.ClockGranularity > 0 {
+		// Seeded here rather than on the first tick: a lookup between New and
+		// that tick would otherwise see the epoch and expire everything.
+		cr.coarse = new(atomic.Int64)
+		cr.coarse.Store(time.Now().UnixNano())
+	}
 
 	c := &Cache[K, V]{core: cr}
 
-	if interval := cr.cleanupInterval(o); interval > 0 {
+	sweepEvery := cr.cleanupInterval(o)
+	if sweepEvery > 0 || cr.coarse != nil {
 		st := &stopper{ch: make(chan struct{})}
 		cr.stop = st
-		go cr.sweepLoop(interval, st.ch)
-		// The sweeper keeps cr alive by itself, so stopping it has to hang off
-		// the handle the caller holds rather than off cr. A caller that drops the
-		// cache without calling Close does not leak the goroutine.
+		if sweepEvery > 0 {
+			go cr.sweepLoop(sweepEvery, st.ch)
+		}
+		if cr.coarse != nil {
+			go cr.clockLoop(o.ClockGranularity, st.ch)
+		}
+		// The goroutines keep cr alive by themselves, so stopping them has to
+		// hang off the handle the caller holds rather than off cr. A caller that
+		// drops the cache without calling Close does not leak them.
 		runtime.AddCleanup(c, (*stopper).stop, st)
 	}
 
@@ -238,21 +294,7 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 
 // Lookup returns the cached value and how the cache answered.
 func (c *Cache[K, V]) Lookup(key K) (V, Status) {
-	v, st, wasExpired := c.core.shardFor(key).get(key, time.Now().UnixNano())
-
-	if c.core.countStats {
-		switch st {
-		case StatusHit:
-			c.core.stats.hits.Add(1)
-		case StatusNegative:
-			c.core.stats.negatives.Add(1)
-		default:
-			c.core.stats.misses.Add(1)
-			if wasExpired {
-				c.core.stats.expirations.Add(1)
-			}
-		}
-	}
+	v, st, _ := c.core.lookup(key)
 
 	return v, st
 }
@@ -265,45 +307,19 @@ func (c *Cache[K, V]) Set(key K, value V) error {
 // SetTTL caches value under key for ttl, overriding Options.TTL. A ttl of zero
 // means the entry never expires on its own.
 func (c *Cache[K, V]) SetTTL(key K, value V, ttl time.Duration) error {
-	var cost int64
-	if c.core.cost != nil {
-		cost = c.core.cost(value)
-	}
-
-	return c.core.store(&entry[K, V]{
-		key:       key,
-		value:     value,
-		cost:      cost,
-		expiresAt: c.core.expiryAt(ttl),
-	})
+	return c.core.setValue(key, value, c.core.valueCost(value), ttl)
 }
 
 // SetNegative records that the upstream reports no such key, for the configured
 // NegativeTTL. Without it, a template that names a deleted object hits the
 // upstream on every single render.
 func (c *Cache[K, V]) SetNegative(key K) error {
-	return c.SetNegativeTTL(key, c.core.negativeTTL)
+	return c.core.setNegative(key, c.core.negativeTTL)
 }
 
 // SetNegativeTTL is SetNegative with an explicit lifetime.
 func (c *Cache[K, V]) SetNegativeTTL(key K, ttl time.Duration) error {
-	if ttl <= 0 {
-		return ErrNegativeDisabled
-	}
-
-	// A negative entry carries no value, but it is not free either: charging it
-	// nothing would make it un-evictable under a byte budget.
-	var cost int64
-	if c.core.cost != nil {
-		cost = negativeCost
-	}
-
-	return c.core.store(&entry[K, V]{
-		key:       key,
-		cost:      cost,
-		expiresAt: c.core.expiryAt(ttl),
-		negative:  true,
-	})
+	return c.core.setNegative(key, ttl)
 }
 
 // Delete removes key and reports whether it was present. OnEvict is not called.
@@ -345,27 +361,21 @@ func (c *Cache[K, V]) Bytes() int64 {
 // Stats returns a snapshot of the counters. It walks every shard, so poll it on
 // a metrics interval rather than per request.
 func (c *Cache[K, V]) Stats() Stats {
-	st := Stats{
-		Hits:         c.core.stats.hits.Load(),
-		Misses:       c.core.stats.misses.Load(),
-		Negatives:    c.core.stats.negatives.Load(),
-		Evictions:    c.core.stats.evictions.Load(),
-		Expirations:  c.core.stats.expirations.Load(),
-		Replacements: c.core.stats.replacements.Load(),
-		Rejections:   c.core.stats.rejections.Load(),
-	}
+	var st Stats
 	for _, s := range c.core.shards {
 		entries, bytes := s.stats()
 		st.Entries += entries
 		st.Bytes += bytes
+		s.counters.addTo(&st)
 	}
 
 	return st
 }
 
-// Close stops the background sweeper. The cache stays usable afterwards; entries
-// then expire only on lookup. Calling Close more than once is safe, and a cache
-// that is simply dropped stops its sweeper too.
+// Close stops the background goroutines. The cache stays usable afterwards:
+// entries then expire only on lookup, and a cache configured with
+// ClockGranularity goes back to reading the wall clock. Calling Close more than
+// once is safe, and a cache that is simply dropped stops its goroutines too.
 func (c *Cache[K, V]) Close() {
 	if c.core.stop != nil {
 		c.core.stop.stop()
@@ -376,11 +386,50 @@ func (c *Cache[K, V]) Close() {
 // it holds no value, but it does hold a key and a map slot.
 const negativeCost int64 = 64
 
+func (c *core[K, V]) valueCost(v V) int64 {
+	if c.cost == nil {
+		return 0
+	}
+
+	return c.cost(v)
+}
+
+func (c *core[K, V]) setValue(key K, value V, cost int64, ttl time.Duration) error {
+	return c.store(&entry[K, V]{
+		key:       key,
+		value:     value,
+		cost:      cost,
+		expiresAt: c.expiryAt(ttl),
+	})
+}
+
+func (c *core[K, V]) setNegative(key K, ttl time.Duration) error {
+	if ttl <= 0 {
+		return ErrNegativeDisabled
+	}
+
+	// A negative entry carries no value, but it is not free either: charging it
+	// nothing would make it un-evictable under a byte budget.
+	var cost int64
+	if c.cost != nil {
+		cost = negativeCost
+	}
+
+	return c.store(&entry[K, V]{
+		key:       key,
+		cost:      cost,
+		expiresAt: c.expiryAt(ttl),
+		negative:  true,
+	})
+}
+
 func (c *core[K, V]) store(e *entry[K, V]) error {
-	replaced, victims, err := c.shardFor(e.key).set(e)
+	s := c.shardFor(e.key)
+
+	replaced, victims, err := s.set(e)
 	if err != nil {
 		if c.countStats {
-			c.stats.rejections.Add(1)
+			s.counters.rejections.Add(1)
 		}
 
 		return err
@@ -388,13 +437,13 @@ func (c *core[K, V]) store(e *entry[K, V]) error {
 
 	if replaced != nil {
 		if c.countStats {
-			c.stats.replacements.Add(1)
+			s.counters.replacements.Add(1)
 		}
 		c.notify(replaced, ReasonReplaced)
 	}
 	for _, v := range victims {
 		if c.countStats {
-			c.stats.evictions.Add(1)
+			s.counters.evictions.Add(1)
 		}
 		c.notify(v, ReasonEvicted)
 	}
@@ -402,12 +451,51 @@ func (c *core[K, V]) store(e *entry[K, V]) error {
 	return nil
 }
 
-func (c *core[K, V]) shardFor(key K) *shard[K, V] {
-	if len(c.shards) == 1 {
-		return c.shards[0]
+// lookup is Cache.Lookup with the shard it landed on, which a view needs in
+// order to count a type miss where the rest of that key's counters live.
+func (c *core[K, V]) lookup(key K) (V, Status, *shard[K, V]) {
+	s := c.shardFor(key)
+	v, st, wasExpired := s.get(key, c.now())
+
+	if c.countStats {
+		switch st {
+		case StatusHit:
+			s.counters.hits.Add(1)
+		case StatusNegative:
+			s.counters.negatives.Add(1)
+		default:
+			s.counters.misses.Add(1)
+			if wasExpired {
+				s.counters.expirations.Add(1)
+			}
+		}
 	}
 
-	return c.shards[maphash.Comparable(c.seed, key)&c.mask]
+	return v, st, s
+}
+
+func (c *core[K, V]) shardIndex(key K) uint64 {
+	if len(c.shards) == 1 {
+		return 0
+	}
+
+	return maphash.Comparable(c.seed, key) & c.mask
+}
+
+func (c *core[K, V]) shardFor(key K) *shard[K, V] {
+	return c.shards[c.shardIndex(key)]
+}
+
+// now is the time expiry is judged against: the wall clock, or what the clock
+// goroutine last read when ClockGranularity asked for one.
+func (c *core[K, V]) now() int64 {
+	if c.coarse != nil {
+		if t := c.coarse.Load(); t != 0 {
+			return t
+		}
+	}
+
+	return time.Now().UnixNano()
 }
 
 // expiryAt turns a TTL into an absolute deadline, spreading it by Jitter percent.
@@ -426,7 +514,7 @@ func (c *core[K, V]) expiryAt(ttl time.Duration) int64 {
 		}
 	}
 
-	return time.Now().Add(ttl).UnixNano()
+	return c.now() + int64(ttl)
 }
 
 func (c *core[K, V]) notify(e *entry[K, V], r EvictReason) {
@@ -442,7 +530,25 @@ func (c *core[K, V]) sweepLoop(interval time.Duration, stop <-chan struct{}) {
 	for {
 		select {
 		case <-t.C:
-			c.sweep(time.Now().UnixNano())
+			c.sweep(c.now())
+		case <-stop:
+			return
+		}
+	}
+}
+
+// clockLoop keeps core.now cheap. On the way out it publishes a zero, which
+// hands lookups back to the wall clock rather than freezing time at whatever
+// this goroutine last saw.
+func (c *core[K, V]) clockLoop(granularity time.Duration, stop <-chan struct{}) {
+	t := time.NewTicker(granularity)
+	defer t.Stop()
+	defer c.coarse.Store(0)
+
+	for {
+		select {
+		case now := <-t.C:
+			c.coarse.Store(now.UnixNano())
 		case <-stop:
 			return
 		}
@@ -453,7 +559,7 @@ func (c *core[K, V]) sweep(now int64) {
 	for _, s := range c.shards {
 		for _, e := range s.sweep(now) {
 			if c.countStats {
-				c.stats.expirations.Add(1)
+				s.counters.expirations.Add(1)
 			}
 			c.notify(e, ReasonExpired)
 		}

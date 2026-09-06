@@ -1,7 +1,9 @@
 package sanecache
 
 import (
+	"context"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -9,13 +11,18 @@ import (
 const benchKeys = 4096
 
 func benchCache(shards int, policy Policy) *Cache[int, int] {
+	return benchCacheClock(shards, policy, 0)
+}
+
+func benchCacheClock(shards int, policy Policy, granularity time.Duration) *Cache[int, int] {
 	c := New(Options[int, int]{
-		TTL:      time.Hour,
-		Jitter:   10,
-		MaxBytes: benchKeys,
-		Cost:     unitCost[int](),
-		Shards:   shards,
-		Policy:   policy,
+		TTL:              time.Hour,
+		Jitter:           10,
+		MaxBytes:         benchKeys,
+		Cost:             unitCost[int](),
+		Shards:           shards,
+		Policy:           policy,
+		ClockGranularity: granularity,
 	})
 	for i := range benchKeys {
 		// The budget is sized to fit exactly these keys, so Set cannot fail.
@@ -90,15 +97,82 @@ func BenchmarkMixed(b *testing.B) {
 	}
 }
 
-// BenchmarkGetSerial isolates the per-operation cost from the contention story.
+// BenchmarkGetSerial isolates the per-operation cost from the contention story,
+// and answers what ClockGranularity is worth: the difference between the two is
+// the wall-clock read that every lookup otherwise does.
 func BenchmarkGetSerial(b *testing.B) {
-	c := benchCache(1, LRU)
-	defer c.Close()
+	for _, tc := range []struct {
+		name        string
+		granularity time.Duration
+	}{
+		{"exact-clock", 0},
+		{"coarse-clock", time.Millisecond},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			c := benchCacheClock(1, LRU, tc.granularity)
+			defer c.Close()
 
+			b.ResetTimer()
+			for i := range b.N {
+				c.Get(i % benchKeys)
+			}
+		})
+	}
+}
+
+// BenchmarkGetOrLoad measures the path a warm cache actually takes: the loader
+// is never called, so what is left is the lookup plus the cost of having the
+// single-flight machinery available at all.
+func BenchmarkGetOrLoad(b *testing.B) {
+	c := New(Options[int, int]{
+		TTL:      time.Hour,
+		MaxBytes: benchKeys,
+		Cost:     unitCost[int](),
+		Loader: func(_ context.Context, key int) (int, error) {
+			return key, nil
+		},
+	})
+	defer c.Close()
+	for i := range benchKeys {
+		_ = c.Set(i, i)
+	}
+
+	ctx := context.Background()
 	b.ResetTimer()
 	for i := range b.N {
-		c.Get(i % benchKeys)
+		_, _ = c.GetOrLoad(ctx, i%benchKeys)
 	}
+}
+
+// BenchmarkView is what a typed view costs over the cache underneath it: one
+// concatenation to namespace the key, and one type assertion on the way out.
+func BenchmarkView(b *testing.B) {
+	c := New(Options[string, any]{TTL: time.Hour})
+	defer c.Close()
+
+	view := NewView(c, ViewOptions[int]{Name: "article"})
+	keys := make([]string, benchKeys)
+	prefixed := make([]string, benchKeys)
+	for i := range keys {
+		keys[i] = strconv.Itoa(i)
+		prefixed[i] = "article:" + keys[i]
+		if err := view.Set(keys[i], i); err != nil {
+			b.Fatalf("Set: %v", err)
+		}
+	}
+
+	b.Run("view", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := range b.N {
+			view.Get(keys[i%benchKeys])
+		}
+	})
+	b.Run("cache", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := range b.N {
+			c.Get(prefixed[i%benchKeys])
+		}
+	})
 }
 
 // BenchmarkClockBaseline is the floor under every lookup: each Get reads the
