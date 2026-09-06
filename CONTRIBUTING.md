@@ -23,11 +23,16 @@ belongs in the README under "when to use something else" rather than in the code
 ## Working on it
 
 ```
-make test    # race detector, twice, to shake out ordering assumptions
-make lint    # golangci-lint plus gofmt
-make bench   # the numbers in the README
-make cover   # coverage report
+make test          # race detector, twice, to shake out ordering assumptions
+make lint          # golangci-lint plus gofmt
+make bench         # the numbers in the README
+make bench-compare # against the other caches, in the benchmarks module
+make cover         # coverage report
 ```
+
+`make bench-compare` is the only thing here that downloads anything: the caches it
+compares against live in `benchmarks/`, which is its own module for exactly that
+reason.
 
 Requires Go 1.24 or newer, which is also what CI tests against alongside the
 current release.

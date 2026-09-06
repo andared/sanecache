@@ -43,6 +43,22 @@ jobs:
           cache: false
       - run: go test -race -count=1 ./...
 
+  # The comparison benchmarks pull in the caches they compare against, so they
+  # live in their own module and are only built and smoke-run here. Their numbers
+  # come from a quiet machine, not from a shared runner.
+  benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      # One run covers both the guard test that every cache here is configured to
+      # actually store things, and a token iteration of each benchmark, which is
+      # what keeps them compiling.
+      - run: go test -bench . -benchtime 10x ./...
+        working-directory: benchmarks
+
   lint:
     runs-on: ubuntu-latest
     steps:

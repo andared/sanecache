@@ -1,8 +1,11 @@
 package sanecache_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/andared/sanecache"
@@ -11,6 +14,10 @@ import (
 type article struct {
 	ID   string
 	Body string
+}
+
+type season struct {
+	Num int
 }
 
 func Example() {
@@ -111,4 +118,84 @@ func ExampleCache_Stats() {
 
 	// Output:
 	// hits=1 negatives=1 misses=1 rate=0.67
+}
+
+// A cold key is fetched once however many callers want it at the same moment.
+func ExampleCache_GetOrLoad() {
+	var upstreamCalls atomic.Int64
+
+	c := sanecache.New(sanecache.Options[string, *article]{
+		TTL:         time.Minute,
+		NegativeTTL: 10 * time.Second,
+		Loader: func(_ context.Context, id string) (*article, error) {
+			upstreamCalls.Add(1)
+			if id == "gone" {
+				// The upstream's own "no such row" is translated once, here, so
+				// that callers see the same error whether the answer came from
+				// the upstream or from the negative entry it left behind.
+				return nil, sanecache.ErrNotFound
+			}
+
+			return &article{ID: id, Body: "hello"}, nil
+		},
+	})
+	defer c.Close()
+
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := c.GetOrLoad(context.Background(), "a1"); err != nil {
+				fmt.Println("load:", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	_, err := c.GetOrLoad(context.Background(), "gone")
+	fmt.Println("missing:", errors.Is(err, sanecache.ErrNotFound))
+
+	// Ten callers, one upstream call — plus the one that came back empty.
+	fmt.Println("upstream calls:", upstreamCalls.Load())
+
+	// Output:
+	// missing: true
+	// upstream calls: 2
+}
+
+// Several value types under one byte budget, which is the only kind of budget
+// that does not need dividing up in advance.
+func ExampleNewView() {
+	c := sanecache.New(sanecache.Options[string, any]{
+		TTL:      10 * time.Minute,
+		MaxBytes: 64 << 20,
+		// The fallback for views that do not bring their own Cost. With several
+		// types sharing a budget, this is where the type switch would go.
+		Cost: func(any) int64 { return 256 },
+	})
+	defer c.Close()
+
+	articles := sanecache.NewView(c, sanecache.ViewOptions[*article]{
+		Name: "article",
+		Cost: func(a *article) int64 { return int64(len(a.Body)) * 3 },
+	})
+	seasons := sanecache.NewView(c, sanecache.ViewOptions[*season]{
+		Name: "season",
+		TTL:  time.Hour, // seasons change less often than articles do
+	})
+
+	_ = articles.Set("1", &article{ID: "1", Body: "hello"})
+	_ = seasons.Set("1", &season{Num: 7})
+
+	a, _ := articles.Get("1")
+	s, _ := seasons.Get("1")
+	fmt.Println(a.Body, s.Num)
+
+	// The same key in two views is two entries: the view name is part of it.
+	fmt.Println("entries:", c.Len(), "bytes:", c.Bytes())
+
+	// Output:
+	// hello 7
+	// entries: 2 bytes: 271
 }

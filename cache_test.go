@@ -9,6 +9,21 @@ import (
 
 func unitCost[V any]() func(V) int64 { return func(V) int64 { return 1 } }
 
+// waitFor polls cond until it holds. It is for the tests whose subject is a
+// background goroutine, where the alternative is a sleep long enough to be slow
+// and short enough to be flaky.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestGetSet(t *testing.T) {
 	c := New(Options[string, int]{})
 	defer c.Close()
@@ -68,6 +83,25 @@ func TestSetNegativeRequiresTTL(t *testing.T) {
 	}
 	if c.Len() != 0 {
 		t.Fatal("rejected negative entry was stored anyway")
+	}
+}
+
+// TestSetNegativeTTLDoesNotNeedTheOption: the lifetime is right there in the
+// call, so there is nothing left for NegativeTTL to enable.
+func TestSetNegativeTTLDoesNotNeedTheOption(t *testing.T) {
+	c := New(Options[string, int]{TTL: time.Minute})
+	defer c.Close()
+
+	if err := c.SetNegativeTTL("gone", time.Minute); err != nil {
+		t.Fatalf("SetNegativeTTL: %v", err)
+	}
+	if _, st := c.Lookup("gone"); st != StatusNegative {
+		t.Fatalf("status = %v; want negative", st)
+	}
+
+	// An explicit zero still means "for no time at all", which is not an entry.
+	if err := c.SetNegativeTTL("other", 0); err != ErrNegativeDisabled {
+		t.Fatalf("err = %v; want ErrNegativeDisabled", err)
 	}
 }
 
@@ -403,6 +437,9 @@ func TestPanicsOnUnworkableOptions(t *testing.T) {
 		"negative budget":     func() { New(Options[string, int]{MaxBytes: -1}) },
 		"negative entries":    func() { New(Options[string, int]{MaxEntries: -1}) },
 		"negative ttl":        func() { New(Options[string, int]{TTL: -time.Second}) },
+		"negative granularity": func() {
+			New(Options[string, int]{ClockGranularity: -time.Second})
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			defer func() {
@@ -489,4 +526,53 @@ func TestClearOnFullCountsAnExpirationOnce(t *testing.T) {
 	if st.Misses != 5 {
 		t.Fatalf("Misses = %d; want 5", st.Misses)
 	}
+}
+
+func TestCoarseClockExpiresEntries(t *testing.T) {
+	c := New(Options[string, int]{
+		ClockGranularity: time.Millisecond,
+		DisableCleanup:   true,
+	})
+	defer c.Close()
+
+	if err := c.SetTTL("a", 1, 10*time.Millisecond); err != nil {
+		t.Fatalf("SetTTL: %v", err)
+	}
+	// The clock is seeded at construction: a cache whose coarse time started at
+	// the epoch would report everything as expired on the first lookup.
+	if _, ok := c.Get("a"); !ok {
+		t.Fatal("entry expired immediately under a coarse clock")
+	}
+
+	waitFor(t, "the coarse clock to pass the TTL", func() bool {
+		_, ok := c.Get("a")
+
+		return !ok
+	})
+}
+
+// TestCoarseClockStopsWithTheCache: a stopped clock that stayed authoritative
+// would freeze time, and nothing would ever expire again.
+func TestCoarseClockStopsWithTheCache(t *testing.T) {
+	c := New(Options[string, int]{
+		ClockGranularity: time.Hour,
+		DisableCleanup:   true,
+	})
+
+	if err := c.SetTTL("a", 1, time.Millisecond); err != nil {
+		t.Fatalf("SetTTL: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	// An hour of granularity means the clock has not moved, so the entry is
+	// still inside its TTL as far as this cache is concerned.
+	if _, ok := c.Get("a"); !ok {
+		t.Fatal("lookups are reading the wall clock, not the coarse one")
+	}
+
+	c.Close()
+	waitFor(t, "lookups to fall back to the wall clock", func() bool {
+		_, ok := c.Get("a")
+
+		return !ok
+	})
 }

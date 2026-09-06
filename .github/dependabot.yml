@@ -6,3 +6,10 @@ updates:
     directory: /
     schedule:
       interval: monthly
+
+  # Only the comparison module has dependencies at all. Keeping them current is
+  # the point: a comparison against three-year-old versions is not one.
+  - package-ecosystem: gomod
+    directory: /benchmarks
+    schedule:
+      interval: monthly
