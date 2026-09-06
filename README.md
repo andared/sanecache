@@ -167,10 +167,12 @@ anywhere else.
 
 **Giving up does not cancel the load for everyone else.** The loader's context is not the
 first caller's. It carries that caller's values, but it is cancelled only when *every*
-caller waiting on the result has gone. `golang.org/x/sync/singleflight` hands the load the
-first caller's context, so a request that times out takes down the load that the other
-ninety-nine are waiting on. A caller who gives up here gets `ctx.Err()` and leaves the
-others alone.
+caller waiting on the result has gone. A bare
+[`singleflight.Group`](https://pkg.go.dev/golang.org/x/sync/singleflight#Group) suppresses
+duplicate calls but takes no context argument and defines no cancellation policy. If its
+callback captures the first caller's context, that caller's timeout can cancel work that
+other callers still need; handling this is the application's responsibility. A caller who
+gives up here gets `ctx.Err()` and leaves the others alone.
 
 **Failures are not cached.** Anything other than `ErrNotFound` is passed back unchanged and
 nothing is stored, so the next call tries again. Single-flight already collapses the retry
@@ -405,7 +407,11 @@ points of hit rate. It is a trade for caches whose access order is flat, not a f
   `Wait()` in the tests.
 - You are caching hundreds of megabytes and GC pressure from millions of live pointers is
   your actual problem → [bigcache](https://github.com/allegro/bigcache) or
-  [freecache](https://github.com/coocood/freecache), which keep entries off-heap.
+  [freecache](https://github.com/coocood/freecache), which reduce GC scanning by storing entries
+  in byte buffers with few pointers. These buffers are on the Go heap; reducing pointer
+  scanning is different from allocating memory outside it. See
+  [BigCache's storage design](https://github.com/allegro/bigcache#how-it-works) and
+  [FreeCache's storage design](https://github.com/coocood/freecache#how-it-is-done).
 - You just want a bounded LRU with TTL and nothing else →
   [hashicorp/golang-lru](https://github.com/hashicorp/golang-lru)'s `v2/expirable`.
 
