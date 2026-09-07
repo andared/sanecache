@@ -1,6 +1,7 @@
 package sanecache
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -19,6 +20,14 @@ type ViewOptions[T any] struct {
 	// handler on the cache can tell whose entry it is looking at. It must not be
 	// empty and must not contain ":".
 	Name string
+
+	// Loader fetches an uncached value using the caller's key without the name
+	// prefix. It follows Options.Loader's error, cancellation and panic policy.
+	// Concurrent loads coalesce within this View instance; reuse the instance
+	// to share in-flight work. Separate views (even with the same name) and the
+	// underlying cache have independent loaders and in-flight work.
+	// A loader must not recursively load the same key through this view.
+	Loader func(context.Context, string) (T, error)
 
 	// Cost reports the memory a value of this view occupies, in bytes, the way
 	// Options.Cost does for the cache as a whole. A view that sets it is spared
@@ -64,6 +73,9 @@ type View[T any] struct {
 	negativeTTL time.Duration
 	countStats  bool
 
+	loader  func(context.Context, string) (T, error)
+	flights []*flightGroup[string, T]
+
 	stats viewCounters
 }
 
@@ -83,6 +95,7 @@ func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 
 	v := &View[T]{
 		cache:       c,
+		loader:      o.Loader,
 		name:        o.Name,
 		prefix:      o.Name + viewSeparator,
 		cost:        o.Cost,
@@ -95,6 +108,13 @@ func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 	}
 	if v.negativeTTL == 0 {
 		v.negativeTTL = c.core.negativeTTL
+	}
+
+	if v.loader != nil {
+		v.flights = make([]*flightGroup[string, T], len(c.core.shards))
+		for i := range v.flights {
+			v.flights[i] = newFlightGroup[string, T]()
+		}
 	}
 
 	return v
@@ -179,6 +199,9 @@ func (v *View[T]) Stats() ViewStats {
 		Misses:     v.stats.misses.Load(),
 		Negatives:  v.stats.negatives.Load(),
 		TypeMisses: v.stats.typeMisses.Load(),
+		Loads:      v.stats.loads.Load(),
+		LoadErrors: v.stats.loadErrors.Load(),
+		Coalesced:  v.stats.coalesced.Load(),
 	}
 }
 
@@ -208,6 +231,10 @@ type ViewStats struct {
 	// name, the only ways to get one are two views sharing a name and writes
 	// made straight to the underlying cache.
 	TypeMisses int64
+
+	Loads      int64 // completed loader calls, including errors and panics
+	LoadErrors int64 // completed loader calls that failed
+	Coalesced  int64 // calls spared a load by another caller
 }
 
 // HitRate reports hits as a fraction of all lookups, counting a cached negative
@@ -226,4 +253,7 @@ type viewCounters struct {
 	misses     atomic.Int64
 	negatives  atomic.Int64
 	typeMisses atomic.Int64
+	loads      atomic.Int64
+	loadErrors atomic.Int64
+	coalesced  atomic.Int64
 }

@@ -54,7 +54,7 @@ With Go 1.24 or newer:
 
 ```sh
 go mod init example.com/cache-demo
-go get github.com/andared/sanecache@v0.2.0
+go get github.com/andared/sanecache@v0.3.0
 go run .
 ```
 
@@ -231,6 +231,29 @@ compiler keeps the joined key on the stack, and past it every read allocates.
 `Stats().TypeMisses` counts lookups that found some other type under a view's key. With
 names in the keys that should never happen, which is the point: it is a bug detector for
 two views sharing a name, or a write made straight to the underlying cache.
+
+Views can load values too:
+
+```go
+articles := sanecache.NewView(c, sanecache.ViewOptions[*Article]{
+    Name:        "article",
+    Cost:        func(a *Article) int64 { return a.ApproxBytes() },
+    NegativeTTL: 30 * time.Second,
+    Loader:      fetchArticle, // func(context.Context, string) (*Article, error)
+})
+a, err := articles.GetOrLoad(ctx, id)
+```
+
+The loader receives the original key, without the namespace prefix. Results use the
+view's cost and TTLs within the shared budget. Errors, cancellation, oversized values
+and panics follow the same rules as `Cache.GetOrLoad` above; a wrong-type entry triggers
+a typed load. With no view loader, `GetOrLoad` returns `ErrNoLoader` even for a cached key.
+
+Reuse the same `View` instance to share in-flight loads. Separate instances have
+independent loaders and flights, including instances with the same name; their stored
+entries still share that namespace. The underlying cache's loader is independent and is
+never used as a fallback. `View.Stats()` includes `Loads`, `LoadErrors` and `Coalesced`;
+the parent cache includes those events in its aggregate counters too.
 
 ## The `Cost` function is the part worth getting right
 
@@ -417,7 +440,7 @@ points of hit rate. It is a trade for caches whose access order is flat, not a f
 
 ## Status
 
-v0.2. The API above is what exists and is tested; expect it to move before v1.
+v0.3. The API above is what exists and is tested; expect it to move before v1.
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for what this
 library optimises for before proposing a change.

@@ -6,15 +6,23 @@ While the major version is 0, the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-07
+
 ### Added
 
 - Runnable basic-cache and HTTP-loader examples, checked by the existing test matrix,
   plus a complete first program and installation commands in the README.
+- `ViewOptions.Loader` and `View.GetOrLoad`, with single-flight per view instance,
+  typed results, per-view cost and TTLs, negative caching, cancellation and panic
+  handling matching the cache loader. View loaders receive unprefixed keys and
+  operate independently from the parent cache's loader.
+- `ViewStats.Loads`, `ViewStats.LoadErrors` and `ViewStats.Coalesced`, also included
+  in the parent cache's counters and controlled by `Options.DisableStats`.
 
-### Planned
+### Changed
 
-- A loader on views, so a typed view over a shared budget gets the same
-  stampede protection the cache has.
+- `ViewOptions` and `ViewStats` gained fields. Update positional struct literals
+  to use named fields; existing named-field literals continue to work.
 
 ### Documentation
 
@@ -70,6 +78,7 @@ First cut.
 - Built-in counters via `Stats`, and an `OnEvict` callback carrying a reason.
 - `ErrTooLarge` from `Set` for values that can never fit.
 
-[Unreleased]: https://github.com/andared/sanecache/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/andared/sanecache/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/andared/sanecache/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/andared/sanecache/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/andared/sanecache/releases/tag/v0.1.0

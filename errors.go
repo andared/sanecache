@@ -24,6 +24,7 @@ var (
 	// loader's own error through to the caller that triggered the load.
 	ErrNotFound = errors.New("sanecache: the upstream has no such key")
 
-	// ErrNoLoader is returned by GetOrLoad when Options.Loader was not set.
+	// ErrNoLoader is returned by GetOrLoad when the cache's Options.Loader or
+	// the view's ViewOptions.Loader was not set.
 	ErrNoLoader = errors.New("sanecache: GetOrLoad requires Options.Loader")
 )
