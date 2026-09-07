@@ -199,3 +199,31 @@ func ExampleNewView() {
 	// hello 7
 	// entries: 2 bytes: 271
 }
+
+func ExampleView_GetOrLoad() {
+	c := sanecache.New(sanecache.Options[string, any]{MaxBytes: 1024, Cost: func(any) int64 { return 64 }})
+	defer c.Close()
+	articles := sanecache.NewView(c, sanecache.ViewOptions[*article]{
+		Name:        "article",
+		NegativeTTL: time.Minute,
+		Loader: func(_ context.Context, id string) (*article, error) {
+			if id == "gone" {
+				return nil, sanecache.ErrNotFound
+			}
+			return &article{ID: id, Body: "hello"}, nil
+		},
+	})
+	a, err := articles.GetOrLoad(context.Background(), "1")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println(a.ID, a.Body)
+	_, err = articles.GetOrLoad(context.Background(), "gone")
+	fmt.Println("missing:", errors.Is(err, sanecache.ErrNotFound))
+	fmt.Println("loads:", articles.Stats().Loads, "total:", c.Stats().Loads)
+	// Output:
+	// 1 hello
+	// missing: true
+	// loads: 2 total: 2
+}

@@ -124,6 +124,28 @@ func (c *core[K, V]) countCoalesced(s *shard[K, V]) {
 // run performs the load and publishes the result. It runs on its own goroutine
 // so that a caller can walk away from a load without ending it.
 func (c *core[K, V]) run(ctx context.Context, g *flightGroup[K, V], s *shard[K, V], key K, cl *call[V]) {
+	g.run(key, cl, func() (V, error) {
+		v, err := c.loader(ctx, key)
+		switch {
+		case err == nil:
+			_ = c.setValue(key, v, c.valueCost(v), c.ttl)
+		case errors.Is(err, ErrNotFound):
+			_ = c.setNegative(key, c.negativeTTL)
+		}
+
+		return v, err
+	}, func(failed bool) {
+		if c.countStats {
+			s.counters.loads.Add(1)
+			if failed {
+				s.counters.loadErrors.Add(1)
+			}
+		}
+	})
+}
+
+// run shares result publication and panic handling between cache and view loads.
+func (g *flightGroup[K, V]) run(key K, cl *call[V], load func() (V, error), record func(bool)) {
 	defer cl.cancel()
 
 	// The loader does not run on a caller's goroutine, so a panic in it would
@@ -136,29 +158,11 @@ func (c *core[K, V]) run(ctx context.Context, g *flightGroup[K, V], s *shard[K, 
 		if r := recover(); r != nil {
 			cl.pan = &loaderPanic{value: r, stack: debug.Stack()}
 		}
-		if c.countStats {
-			s.counters.loads.Add(1)
-			if cl.err != nil || cl.pan != nil {
-				s.counters.loadErrors.Add(1)
-			}
-		}
+		record(cl.err != nil || cl.pan != nil)
 		g.finish(key, cl)
 	}()
 
-	v, err := c.loader(ctx, key)
-	cl.val, cl.err = v, err
-
-	// Cached before the waiters are released, so that a caller who looks the key
-	// up again straight away finds it, and a caller arriving a moment later does
-	// not start a second load for a value that is already in hand.
-	switch {
-	case err == nil:
-		_ = c.setValue(key, v, c.valueCost(v), c.ttl)
-	case errors.Is(err, ErrNotFound):
-		// ErrNegativeDisabled is not a problem here: a cache without NegativeTTL
-		// simply does not remember the answer.
-		_ = c.setNegative(key, c.negativeTTL)
-	}
+	cl.val, cl.err = load()
 }
 
 // wait blocks until the load finishes or ctx is done, whichever comes first.
