@@ -41,18 +41,20 @@ func (v *View[T]) load(ctx context.Context, key string) (T, error) {
 	}
 
 	g.mu.Lock()
-	if cl, ok := g.calls[key]; ok {
+	if cl, ok := g.calls[key]; ok && cl.token.valid.Load() {
 		cl.waiters++
 		g.mu.Unlock()
 		coalesced()
 
 		return g.wait(ctx, key, cl)
 	}
+	token := s.beginLoad(fullKey)
 	// Recheck without counting another lookup: a load may have published since
 	// the caller's miss. A value of a different type still needs a typed load.
 	raw, st, _ := s.get(fullKey, c.now())
 	val, typed := raw.(T)
 	if st == StatusNegative || (st == StatusHit && typed) {
+		s.endLoad(fullKey, token)
 		g.mu.Unlock()
 		coalesced()
 		if st == StatusNegative {
@@ -64,28 +66,31 @@ func (v *View[T]) load(ctx context.Context, key string) (T, error) {
 		return val, nil
 	}
 	loadCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	cl := &call[T]{done: make(chan struct{}), waiters: 1, cancel: cancel}
+	cl := &call[T]{done: make(chan struct{}), waiters: 1, cancel: cancel, token: token}
 	g.calls[key] = cl
 	g.mu.Unlock()
 
-	go g.run(key, cl, func() (T, error) {
-		value, err := v.loader(loadCtx, key)
-		switch {
-		case err == nil:
-			_ = v.Set(key, value)
-		case errors.Is(err, ErrNotFound):
-			_ = v.SetNegative(key)
-		}
+	go func() {
+		defer s.endLoad(fullKey, token)
+		g.run(key, cl, func() (T, error) {
+			value, err := v.loader(loadCtx, key)
+			switch {
+			case err == nil:
+				_ = c.setValue(fullKey, value, v.valueCost(value), v.ttl, token)
+			case errors.Is(err, ErrNotFound):
+				_ = c.setNegative(fullKey, v.negativeTTL, token)
+			}
 
-		return value, err
-	}, func(failed bool) {
-		v.count(&v.stats.loads)
-		v.count(&s.counters.loads)
-		if failed {
-			v.count(&v.stats.loadErrors)
-			v.count(&s.counters.loadErrors)
-		}
-	})
+			return value, err
+		}, func(failed bool) {
+			v.count(&v.stats.loads)
+			v.count(&s.counters.loads)
+			if failed {
+				v.count(&v.stats.loadErrors)
+				v.count(&s.counters.loadErrors)
+			}
+		})
+	}()
 
 	return g.wait(ctx, key, cl)
 }

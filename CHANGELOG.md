@@ -6,6 +6,27 @@ While the major version is 0, the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-09
+
+### Changed
+
+- `Delete` (including absent keys), `Clear`, and successful explicit writes now
+  prevent outstanding loaders from publishing obsolete results. New callers no
+  longer join invalidated flights; existing waiters still receive their result.
+- The guarantee applies to cache loaders and typed view loaders across the same
+  storage key, including separate views sharing a namespace. Successful loader
+  publications also supersede competing outstanding loads. Rejected writes leave
+  outstanding loads unchanged.
+- A cancelled loader that ignores its context may still warm the cache, but can
+  no longer overwrite a successful write or repopulate an explicitly invalidated
+  key. No public signatures changed; callers relying on the old late-publication
+  behaviour must account for the stronger invalidation guarantee.
+
+### Documentation
+
+- Documented invalidation ordering, existing-waiter results, concurrent `Clear`,
+  and the distinction between invalidation and `Close`.
+
 ## [0.3.0] - 2026-09-07
 
 ### Added
@@ -78,7 +99,8 @@ First cut.
 - Built-in counters via `Stats`, and an `OnEvict` callback carrying a reason.
 - `ErrTooLarge` from `Set` for values that can never fit.
 
-[Unreleased]: https://github.com/andared/sanecache/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/andared/sanecache/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/andared/sanecache/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/andared/sanecache/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/andared/sanecache/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/andared/sanecache/releases/tag/v0.1.0

@@ -54,7 +54,7 @@ With Go 1.24 or newer:
 
 ```sh
 go mod init example.com/cache-demo
-go get github.com/andared/sanecache@v0.3.0
+go get github.com/andared/sanecache@v0.4.0
 go run .
 ```
 
@@ -183,12 +183,32 @@ possible. If it panics, the panic is carried to the callers rather than taking t
 down, and it arrives with the stack of where it actually happened. A load that needs a
 deadline of its own should set one inside the loader, where the right number is known.
 
-A load with no caller left is cancelled — but a loader that does not watch its context
-finishes anyway, and its value is cached even then. That is deliberate: when callers time
-out faster than the upstream answers, throwing those values away means the cache never warms
-and every request keeps timing out. The price is the narrow case where such a load lands
-after a later one and puts back a value read before it, with the TTL starting again. A
-loader that honours cancellation never reaches it.
+A load with no caller left is cancelled. A loader that ignores cancellation can still
+warm the cache, provided its result has not been superseded by an explicit invalidation
+or a successful write, including another loader's publication.
+
+## Invalidation while loading
+
+`Delete` invalidates outstanding loads for the key, even when it returns `false` because
+there was no stored entry. `Clear` invalidates outstanding loads as it clears each shard.
+Successful `Set`, `SetTTL`, `SetNegative` and `SetNegativeTTL` calls also prevent older
+loads from overwriting their result. Rejected writes leave outstanding loads unchanged.
+
+For example, if a loader reads an old record, and the application updates the source and
+then calls `Delete`, that loader cannot put the old record back into the cache. Callers
+already waiting for it still receive its result; invalidation neither cancels those
+requests nor retries them. A new caller after invalidation does not join the obsolete load.
+This is a cache-publication guarantee, not a guarantee that every running request sees
+fresh data. Update the source before invalidating the cache.
+
+The guarantee follows the storage key: it applies across views sharing a namespace and
+to writes or deletes made through the parent cache. Successful loader publications also
+supersede other outstanding loads for the same storage key. Invalidation tracking exists
+only for active loads; deleted keys do not leave permanent metadata behind.
+
+`Clear` visits shards individually, so it is not an atomic snapshot or a pause on traffic.
+New loads and writes may repopulate a shard after it has been cleared. `Close` still only
+stops maintenance goroutines; it does not invalidate entries or cancel loaders.
 
 ## Several value types under one budget
 

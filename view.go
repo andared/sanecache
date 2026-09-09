@@ -186,7 +186,9 @@ func (v *View[T]) SetNegativeTTL(key string, ttl time.Duration) error {
 	return v.cache.core.setNegative(v.prefix+key, ttl)
 }
 
-// Delete removes key from this view and reports whether it was present.
+// Delete removes key from this view and reports whether it was present. It also
+// invalidates outstanding loads for the namespaced key, including those in other
+// views or the parent cache. Existing waiters still receive their loader result.
 func (v *View[T]) Delete(key string) bool {
 	return v.cache.Delete(v.prefix + key)
 }

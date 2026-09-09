@@ -16,7 +16,9 @@ import (
 // A cached "does not exist" answer is reported as ErrNotFound without calling
 // the loader. A loaded value is stored before this returns, so the next caller
 // finds it cached; a value too large for the budget is still returned, counted
-// as a rejection rather than quietly retried forever.
+// as a rejection rather than quietly retried forever. Invalidation or a successful
+// write during loading suppresses publication, but the waiting callers still
+// receive the loader result. New callers do not join invalidated loads.
 //
 // Errors other than ErrNotFound are returned as the loader produced them and are
 // not cached, so the next call tries again.
@@ -46,10 +48,11 @@ func (c *Cache[K, V]) GetOrLoad(ctx context.Context, key K) (V, error) {
 // call is one load in flight. Waiters read val and err only after done is
 // closed, which is what publishes them.
 type call[V any] struct {
-	done chan struct{}
-	val  V
-	err  error
-	pan  *loaderPanic
+	done  chan struct{}
+	val   V
+	err   error
+	pan   *loaderPanic
+	token *loadToken
 
 	// waiters and cancel are guarded by the group's mutex. The count exists so
 	// that one caller giving up does not cancel the load the others are waiting
@@ -75,13 +78,15 @@ func (c *core[K, V]) load(ctx context.Context, key K) (V, error) {
 	g, s := c.flights[idx], c.shards[idx]
 
 	g.mu.Lock()
-	if cl, ok := g.calls[key]; ok {
+	if cl, ok := g.calls[key]; ok && cl.token.valid.Load() {
 		cl.waiters++
 		g.mu.Unlock()
 		c.countCoalesced(s)
 
 		return g.wait(ctx, key, cl)
 	}
+
+	token := s.beginLoad(key)
 
 	// The caller's own lookup happened before this lock, and a load that
 	// finished in between is gone from the map by now — but it publishes its
@@ -91,6 +96,7 @@ func (c *core[K, V]) load(ctx context.Context, key K) (V, error) {
 	// for a value that is already cached. Counted without stats, because the
 	// caller's lookup has already been counted as the miss it was.
 	if v, st, _ := s.get(key, c.now()); st != StatusMiss {
+		s.endLoad(key, token)
 		g.mu.Unlock()
 		c.countCoalesced(s)
 
@@ -106,7 +112,7 @@ func (c *core[K, V]) load(ctx context.Context, key K) (V, error) {
 	// The load outlives the caller that starts it, so it does not inherit that
 	// caller's cancellation: values yes, deadline no. See call.waiters.
 	loadCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	cl := &call[V]{done: make(chan struct{}), waiters: 1, cancel: cancel}
+	cl := &call[V]{done: make(chan struct{}), waiters: 1, cancel: cancel, token: token}
 	g.calls[key] = cl
 	g.mu.Unlock()
 
@@ -124,13 +130,14 @@ func (c *core[K, V]) countCoalesced(s *shard[K, V]) {
 // run performs the load and publishes the result. It runs on its own goroutine
 // so that a caller can walk away from a load without ending it.
 func (c *core[K, V]) run(ctx context.Context, g *flightGroup[K, V], s *shard[K, V], key K, cl *call[V]) {
+	defer s.endLoad(key, cl.token)
 	g.run(key, cl, func() (V, error) {
 		v, err := c.loader(ctx, key)
 		switch {
 		case err == nil:
-			_ = c.setValue(key, v, c.valueCost(v), c.ttl)
+			_ = c.setValue(key, v, c.valueCost(v), c.ttl, cl.token)
 		case errors.Is(err, ErrNotFound):
-			_ = c.setNegative(key, c.negativeTTL)
+			_ = c.setNegative(key, c.negativeTTL, cl.token)
 		}
 
 		return v, err
