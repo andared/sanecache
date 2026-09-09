@@ -306,20 +306,22 @@ func (c *Cache[K, V]) Lookup(key K) (V, Status) {
 	return v, st
 }
 
-// Set caches value under key for the configured TTL.
+// Set caches value under key for the configured TTL. A successful write prevents
+// outstanding loads for the key from publishing over it. Rejected writes do not.
 func (c *Cache[K, V]) Set(key K, value V) error {
 	return c.SetTTL(key, value, c.core.ttl)
 }
 
 // SetTTL caches value under key for ttl, overriding Options.TTL. A ttl of zero
-// means the entry never expires on its own.
+// means the entry never expires on its own. Successful writes supersede outstanding
+// loads for the key.
 func (c *Cache[K, V]) SetTTL(key K, value V, ttl time.Duration) error {
 	return c.core.setValue(key, value, c.core.valueCost(value), ttl)
 }
 
 // SetNegative records that the upstream reports no such key, for the configured
 // NegativeTTL. Without it, a template that names a deleted object hits the
-// upstream on every single render.
+// upstream on every single render. A successful write supersedes outstanding loads.
 func (c *Cache[K, V]) SetNegative(key K) error {
 	return c.core.setNegative(key, c.core.negativeTTL)
 }
@@ -329,14 +331,18 @@ func (c *Cache[K, V]) SetNegativeTTL(key K, ttl time.Duration) error {
 	return c.core.setNegative(key, ttl)
 }
 
-// Delete removes key and reports whether it was present. OnEvict is not called.
+// Delete removes key and reports whether it was present. It also invalidates
+// outstanding loads for key, even when no entry was present. Existing waiters
+// still receive their load result, but it cannot be cached. OnEvict is not called.
 func (c *Cache[K, V]) Delete(key K) bool {
 	_, ok := c.core.shardFor(key).delete(key)
 
 	return ok
 }
 
-// Clear empties the cache. OnEvict is not called.
+// Clear removes entries and invalidates outstanding loads, shard by shard.
+// Concurrent new loads and writes can repopulate shards already cleared. Existing
+// waiters still receive their load results. OnEvict is not called.
 func (c *Cache[K, V]) Clear() {
 	for _, s := range c.core.shards {
 		s.clear()
@@ -401,16 +407,16 @@ func (c *core[K, V]) valueCost(v V) int64 {
 	return c.cost(v)
 }
 
-func (c *core[K, V]) setValue(key K, value V, cost int64, ttl time.Duration) error {
+func (c *core[K, V]) setValue(key K, value V, cost int64, ttl time.Duration, tokens ...*loadToken) error {
 	return c.store(&entry[K, V]{
 		key:       key,
 		value:     value,
 		cost:      cost,
 		expiresAt: c.expiryAt(ttl),
-	})
+	}, tokens...)
 }
 
-func (c *core[K, V]) setNegative(key K, ttl time.Duration) error {
+func (c *core[K, V]) setNegative(key K, ttl time.Duration, tokens ...*loadToken) error {
 	if ttl <= 0 {
 		return ErrNegativeDisabled
 	}
@@ -427,13 +433,13 @@ func (c *core[K, V]) setNegative(key K, ttl time.Duration) error {
 		cost:      cost,
 		expiresAt: c.expiryAt(ttl),
 		negative:  true,
-	})
+	}, tokens...)
 }
 
-func (c *core[K, V]) store(e *entry[K, V]) error {
+func (c *core[K, V]) store(e *entry[K, V], tokens ...*loadToken) error {
 	s := c.shardFor(e.key)
 
-	replaced, victims, err := s.set(e)
+	replaced, victims, err := s.set(e, tokens...)
 	if err != nil {
 		if c.countStats {
 			s.counters.rejections.Add(1)

@@ -1,6 +1,9 @@
 package sanecache
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // entry is a single cached item. Entries are linked into an intrusive LRU list
 // so that eviction needs no allocation and no side table.
@@ -24,6 +27,9 @@ func (e *entry[K, V]) expired(now int64) bool {
 type shard[K comparable, V any] struct {
 	mu    sync.RWMutex
 	items map[K]*entry[K, V]
+
+	// Only active loads are tracked; invalidation never leaves per-key tombstones.
+	loads map[K]map[*loadToken]struct{}
 
 	head, tail *entry[K, V]
 
@@ -126,13 +132,18 @@ func (s *shard[K, V]) get(key K, now int64) (V, Status, bool) {
 // set stores e, returning the entry it replaced (if any) and the entries evicted
 // to stay inside the budget. A value that cannot fit on its own is rejected with
 // ErrTooLarge rather than stored and silently dropped later.
-func (s *shard[K, V]) set(e *entry[K, V]) (replaced *entry[K, V], victims []*entry[K, V], err error) {
+func (s *shard[K, V]) set(e *entry[K, V], tokens ...*loadToken) (replaced *entry[K, V], victims []*entry[K, V], err error) {
 	if s.maxBytes > 0 && e.cost > s.maxBytes {
 		return nil, nil, ErrTooLarge
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if len(tokens) > 0 && !tokens[0].valid.Load() {
+		return nil, nil, nil
+	}
+	s.invalidateLoads(e.key)
 
 	if old, ok := s.items[e.key]; ok {
 		s.remove(old)
@@ -150,6 +161,7 @@ func (s *shard[K, V]) delete(key K) (*entry[K, V], bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.invalidateLoads(key)
 	e, ok := s.items[key]
 	if !ok {
 		return nil, false
@@ -179,6 +191,9 @@ func (s *shard[K, V]) clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	for key := range s.loads {
+		s.invalidateLoads(key)
+	}
 	s.items = make(map[K]*entry[K, V])
 	s.head, s.tail, s.bytes = nil, nil, 0
 }
@@ -266,4 +281,40 @@ func (s *shard[K, V]) unlink(e *entry[K, V]) {
 		s.tail = e.prev
 	}
 	e.prev, e.next = nil, nil
+}
+
+// loadToken connects a flight to mutations of its storage key, including writes
+// through other views. Validity is checked under the storage lock when publishing.
+type loadToken struct{ valid atomic.Bool }
+
+func (s *shard[K, V]) beginLoad(key K) *loadToken {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	token := &loadToken{}
+	token.valid.Store(true)
+	if s.loads == nil {
+		s.loads = make(map[K]map[*loadToken]struct{})
+	}
+	if s.loads[key] == nil {
+		s.loads[key] = make(map[*loadToken]struct{})
+	}
+	s.loads[key][token] = struct{}{}
+	return token
+}
+
+func (s *shard[K, V]) endLoad(key K, token *loadToken) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.loads[key], token)
+	if len(s.loads[key]) == 0 {
+		delete(s.loads, key)
+	}
+}
+
+// invalidateLoads is called with s.mu held, atomically with the mutation.
+func (s *shard[K, V]) invalidateLoads(key K) {
+	for token := range s.loads[key] {
+		token.valid.Store(false)
+	}
+	delete(s.loads, key)
 }
