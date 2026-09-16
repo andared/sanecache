@@ -50,7 +50,7 @@ func TestViewLoaderCoalesces(t *testing.T) {
 func TestViewLoaderPolicies(t *testing.T) {
 	for _, disabled := range []bool{false, true} {
 		t.Run(fmt.Sprint(disabled), func(t *testing.T) {
-			c := New(Options[string, any]{TTL: time.Hour, NegativeTTL: time.Hour, MaxBytes: 100, Cost: func(any) int64 { return 1 }, DisableStats: disabled, DisableCleanup: true})
+			c := New(Options[string, any]{TTL: time.Hour, NegativeTTL: time.Hour, MaxBytes: 1000, Cost: func(any) int64 { return 1 }, DisableStats: disabled, DisableCleanup: true})
 			defer c.Close()
 			// Drive expiry explicitly so scheduler delays cannot expire recheck fixtures.
 			c.core.coarse = new(atomic.Int64)
@@ -64,7 +64,7 @@ func TestViewLoaderPolicies(t *testing.T) {
 				case "error":
 					return "", errUpstream
 				case "large":
-					return strings.Repeat("x", 101), nil
+					return strings.Repeat("x", 1001), nil
 				}
 				return "hello", nil
 			}})
@@ -102,7 +102,7 @@ func TestViewLoaderPolicies(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if got, err := v.GetOrLoad(ctx, "large"); len(got) != 101 || err != nil {
+			if got, err := v.GetOrLoad(ctx, "large"); len(got) != 1001 || err != nil {
 				t.Fatalf("oversized: %q, %v", got, err)
 			}
 			if _, ok := v.Get("large"); ok {
@@ -282,7 +282,7 @@ func TestViewLoaderPanicAndRetry(t *testing.T) {
 func TestViewLoadsShareBudgetAndInheritOptions(t *testing.T) {
 	for _, policy := range []Policy{LRU, ClearOnFull} {
 		t.Run(fmt.Sprint(policy), func(t *testing.T) {
-			c := New(Options[string, any]{MaxBytes: 128, Cost: func(any) int64 { return 64 }, TTL: time.Minute, NegativeTTL: time.Minute, DisableCleanup: true, Policy: policy})
+			c := New(Options[string, any]{MaxBytes: 512, Cost: func(any) int64 { return 256 }, TTL: time.Minute, NegativeTTL: time.Minute, DisableCleanup: true, Policy: policy})
 			defer c.Close()
 			c.core.coarse = new(atomic.Int64)
 			c.core.coarse.Store(time.Now().UnixNano())
@@ -300,7 +300,7 @@ func TestViewLoadsShareBudgetAndInheritOptions(t *testing.T) {
 			if _, err := texts.GetOrLoad(ctx, "k"); err != nil {
 				t.Fatal(err)
 			}
-			if c.Bytes() != 128 {
+			if c.Bytes() != 512 {
 				t.Fatalf("fallback cost: %d", c.Bytes())
 			}
 			if _, err := texts.GetOrLoad(ctx, "next"); err != nil {

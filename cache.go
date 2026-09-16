@@ -401,9 +401,24 @@ func (c *Cache[K, V]) Close() {
 	}
 }
 
-// negativeCost is what a "does not exist" marker is charged under a byte budget:
-// it holds no value, but it does hold a key and a map slot.
-const negativeCost int64 = 64
+// entryOverhead is what an entry occupies apart from its value and the bytes of a
+// string key: the entry itself and its share of the shard map. Measured by
+// BenchmarkNegativeEntryMemory at 115-133 bytes for a Cache[string, any],
+// depending on how full the map is, and about 16 less for a value type of one
+// word; a "does not exist" marker is charged this much plus its key.
+const entryOverhead int64 = 128
+
+// negativeCost is what a "does not exist" marker is charged under a byte budget.
+// It holds no value, but it does hold an entry, a map slot and the key; string
+// keys are usually the ones worth counting, since a view builds a fresh one for
+// every write and the entry keeps it alive.
+func negativeCost[K comparable](key K) int64 {
+	if s, ok := any(key).(string); ok {
+		return entryOverhead + int64(len(s))
+	}
+
+	return entryOverhead
+}
 
 func (c *core[K, V]) valueCost(v V) int64 {
 	if c.cost == nil {
@@ -431,7 +446,7 @@ func (c *core[K, V]) setNegative(key K, ttl time.Duration, tokens ...*loadToken)
 	// nothing would make it un-evictable under a byte budget.
 	var cost int64
 	if c.cost != nil {
-		cost = negativeCost
+		cost = negativeCost(key)
 	}
 
 	return c.store(&entry[K, V]{

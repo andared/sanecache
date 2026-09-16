@@ -41,7 +41,7 @@ func TestLoadInvalidation(t *testing.T) {
 					var lookup func(string) (int, Status)
 					var mutate func() error
 					if view {
-						c := New(Options[string, any]{MaxBytes: 100, Cost: func(any) int64 { return 1 }, NegativeTTL: time.Minute})
+						c := New(Options[string, any]{MaxBytes: 1000, Cost: func(any) int64 { return 1 }, NegativeTTL: time.Minute})
 						defer c.Close()
 						v := NewView(c, ViewOptions[int]{Name: "items", Loader: loader})
 						load, lookup = v.GetOrLoad, v.Lookup
@@ -58,12 +58,12 @@ func TestLoadInvalidation(t *testing.T) {
 							case "negative":
 								return writer.SetNegative("k")
 							case "rejected":
-								return writer.Set("k", 101)
+								return writer.Set("k", 1001)
 							}
 							return nil
 						}
 					} else {
-						c := New(Options[string, int]{MaxBytes: 100, Cost: func(n int) int64 { return int64(n) }, NegativeTTL: time.Minute, Loader: loader})
+						c := New(Options[string, int]{MaxBytes: 1000, Cost: func(n int) int64 { return int64(n) }, NegativeTTL: time.Minute, Loader: loader})
 						defer c.Close()
 						load, lookup = c.GetOrLoad, c.Lookup
 						mutate = func() error {
@@ -77,7 +77,7 @@ func TestLoadInvalidation(t *testing.T) {
 							case "negative":
 								return c.SetNegative("k")
 							case "rejected":
-								return c.Set("k", 101)
+								return c.Set("k", 1001)
 							}
 							return nil
 						}
