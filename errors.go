@@ -31,5 +31,5 @@ var (
 
 	// ErrNoLoader is returned by GetOrLoad when the cache's Options.Loader or
 	// the view's ViewOptions.Loader was not set.
-	ErrNoLoader = errors.New("sanecache: GetOrLoad requires Options.Loader")
+	ErrNoLoader = errors.New("sanecache: GetOrLoad requires a loader (Options.Loader or ViewOptions.Loader)")
 )
