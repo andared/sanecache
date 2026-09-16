@@ -21,6 +21,13 @@ While the major version is 0, the public API may change in any release.
   same name on the same cache share one set of counters, as they already share keys.
   `View.Stats` on either instance now reports both. Code that opened several instances of
   one name and read their counters separately must read them as one.
+- The text of `ErrNoLoader` names both places a loader can come from. Compare with
+  `errors.Is`, not with the string.
+
+### Documentation
+
+- `Options.Loader` no longer claims that a loader ignoring cancellation can put back a stale
+  value; the invalidation added in 0.4.0 prevents that.
 
 ## [0.4.0] - 2026-09-09
 

@@ -138,9 +138,9 @@ type Options[K comparable, V any] struct {
 	// A load that nobody is waiting for any more is cancelled, but a loader that
 	// does not watch its context finishes regardless, and its value is cached
 	// even so. That is what keeps a cache warming when callers time out faster
-	// than the upstream answers; the price is that such a load can land after a
-	// later one and put back a value read before it, with the TTL starting over.
-	// A loader that honours cancellation never gets there.
+	// than the upstream answers. It cannot put back a stale value: a Delete, a
+	// Clear or a successful write of the key since the load started, including
+	// another load's publication, keeps its result out of the cache.
 	Loader func(ctx context.Context, key K) (V, error)
 
 	// Shards splits the cache into independently locked parts, rounded up to a
