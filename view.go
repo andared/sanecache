@@ -82,16 +82,36 @@ type View[T any] struct {
 
 // NewView opens a view named o.Name onto c. It panics on a name that cannot keep
 // views apart, for the same reason New panics on a budget it cannot honour.
+//
+// A nil c opens a view with caching switched off, for the configuration where a
+// TTL of zero means "do not cache": code keeps calling GetOrLoad either way. Such
+// a view runs the loader on every call, still sharing one call among callers who
+// arrive while it runs, and remembers nothing, "does not exist" included. Its
+// lookups are misses, Delete reports false, and writes fail with ErrDisabled.
+// Its counters are its own.
 func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 	switch {
-	case c == nil:
-		panic("sanecache: NewView needs a cache")
 	case o.Name == "":
 		panic("sanecache: ViewOptions.Name must not be empty; the name is what keeps views apart")
 	case strings.Contains(o.Name, viewSeparator):
 		panic(fmt.Sprintf("sanecache: ViewOptions.Name must not contain %q, got %q", viewSeparator, o.Name))
 	case o.TTL < 0 || o.NegativeTTL < 0:
 		panic("sanecache: ViewOptions TTL and NegativeTTL must not be negative")
+	}
+
+	if c == nil {
+		v := &View[T]{
+			loader:     o.Loader,
+			name:       o.Name,
+			prefix:     o.Name + viewSeparator,
+			countStats: true,
+			stats:      new(viewCounters),
+		}
+		if v.loader != nil {
+			v.flights = []*flightGroup[string, T]{newFlightGroup[string, T]()}
+		}
+
+		return v
 	}
 
 	v := &View[T]{
@@ -140,6 +160,12 @@ func (v *View[T]) Get(key string) (T, bool) {
 func (v *View[T]) Lookup(key string) (T, Status) {
 	var zero T
 
+	if v.cache == nil {
+		v.count(&v.stats.misses)
+
+		return zero, StatusMiss
+	}
+
 	raw, st, shard := v.cache.core.lookup(v.prefix + key)
 	switch st {
 	case StatusHit:
@@ -174,17 +200,25 @@ func (v *View[T]) Set(key string, value T) error {
 // SetTTL caches value under key for ttl, overriding both the view's and the
 // cache's TTL. A ttl of zero means the entry never expires on its own.
 func (v *View[T]) SetTTL(key string, value T, ttl time.Duration) error {
+	if v.cache == nil {
+		return ErrDisabled
+	}
+
 	return v.cache.core.setValue(v.prefix+key, value, v.valueCost(value), ttl)
 }
 
 // SetNegative records that the upstream reports no such key, for the view's
 // NegativeTTL.
 func (v *View[T]) SetNegative(key string) error {
-	return v.cache.core.setNegative(v.prefix+key, v.negativeTTL)
+	return v.SetNegativeTTL(key, v.negativeTTL)
 }
 
 // SetNegativeTTL is SetNegative with an explicit lifetime.
 func (v *View[T]) SetNegativeTTL(key string, ttl time.Duration) error {
+	if v.cache == nil {
+		return ErrDisabled
+	}
+
 	return v.cache.core.setNegative(v.prefix+key, ttl)
 }
 
@@ -192,6 +226,10 @@ func (v *View[T]) SetNegativeTTL(key string, ttl time.Duration) error {
 // invalidates outstanding loads for the namespaced key, including those in other
 // views or the parent cache. Existing waiters still receive their loader result.
 func (v *View[T]) Delete(key string) bool {
+	if v.cache == nil {
+		return false
+	}
+
 	return v.cache.Delete(v.prefix + key)
 }
 

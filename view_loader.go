@@ -26,8 +26,41 @@ func (v *View[T]) GetOrLoad(ctx context.Context, key string) (T, error) {
 	if err := ctx.Err(); err != nil {
 		return zero, err
 	}
+	if v.cache == nil {
+		return v.loadUncached(ctx, key)
+	}
 
 	return v.load(ctx, key)
+}
+
+// loadUncached is load for a view without a cache: callers still share one call
+// while it runs, but its result, "does not exist" included, is not kept.
+func (v *View[T]) loadUncached(ctx context.Context, key string) (T, error) {
+	g := v.flights[0]
+
+	g.mu.Lock()
+	if cl, ok := g.calls[key]; ok {
+		cl.waiters++
+		g.mu.Unlock()
+		v.count(&v.stats.coalesced)
+
+		return g.wait(ctx, key, cl)
+	}
+	loadCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	cl := &call[T]{done: make(chan struct{}), waiters: 1, cancel: cancel}
+	g.calls[key] = cl
+	g.mu.Unlock()
+
+	go g.run(key, cl, func() (T, error) {
+		return v.loader(loadCtx, key)
+	}, func(failed bool) {
+		v.count(&v.stats.loads)
+		if failed {
+			v.count(&v.stats.loadErrors)
+		}
+	})
+
+	return g.wait(ctx, key, cl)
 }
 
 func (v *View[T]) load(ctx context.Context, key string) (T, error) {

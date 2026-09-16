@@ -365,7 +365,10 @@ func TestNewViewPanicsOnUnusableNames(t *testing.T) {
 	defer c.Close()
 
 	for name, build := range map[string]func(){
-		"nil cache":     func() { NewView(nil, ViewOptions[*article]{Name: "article"}) },
+		"nil cache, empty name": func() { NewView(nil, ViewOptions[*article]{}) },
+		"nil cache, name with sep": func() {
+			NewView(nil, ViewOptions[*article]{Name: "a:b"})
+		},
 		"empty name":    func() { NewView(c, ViewOptions[*article]{}) },
 		"name with sep": func() { NewView(c, ViewOptions[*article]{Name: "a:b"}) },
 		"negative ttl": func() {

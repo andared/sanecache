@@ -24,6 +24,11 @@ var (
 	// loader's own error through to the caller that triggered the load.
 	ErrNotFound = errors.New("sanecache: the upstream has no such key")
 
+	// ErrDisabled is returned by the writes of a view opened on a nil cache. Such a
+	// view stores nothing, and a write that reported success would be a write the
+	// next read cannot see.
+	ErrDisabled = errors.New("sanecache: the view has no cache to write to")
+
 	// ErrNoLoader is returned by GetOrLoad when the cache's Options.Loader or
 	// the view's ViewOptions.Loader was not set.
 	ErrNoLoader = errors.New("sanecache: GetOrLoad requires Options.Loader")
