@@ -211,6 +211,12 @@ type core[K comparable, V any] struct {
 	loader  func(context.Context, K) (V, error)
 	flights []*flightGroup[K, V]
 
+	// views holds one set of counters per view name. Views with the same name
+	// share a namespace in storage, so they share counters too; the map only
+	// grows with the number of distinct names, which is fixed by the program.
+	viewsMu sync.Mutex
+	views   map[string]*viewCounters
+
 	// coarse holds the time a background goroutine last read, in unix
 	// nanoseconds, or nil when the cache reads the clock itself. Zero means the
 	// goroutine has stopped and the wall clock is authoritative again.

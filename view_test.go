@@ -268,6 +268,83 @@ func TestViewStats(t *testing.T) {
 	}
 }
 
+// A view name is a namespace in storage, so two views of one name are one set of
+// entries; counting them apart would make each view's numbers a partial story.
+func TestViewsOfOneNameShareCounters(t *testing.T) {
+	c := newViewCache(Options[string, any]{})
+	defer c.Close()
+
+	first := NewView(c, ViewOptions[*article]{Name: "article"})
+	second := NewView(c, ViewOptions[*article]{Name: "article"})
+	if err := first.Set("1", &article{id: "1"}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	first.Get("1")  // hit
+	second.Get("1") // hit, through the other instance
+	second.Get("2") // miss
+
+	want := ViewStats{Hits: 2, Misses: 1}
+	if got := first.Stats(); got != want {
+		t.Fatalf("first.Stats = %+v; want %+v", got, want)
+	}
+	if got := second.Stats(); got != want {
+		t.Fatalf("second.Stats = %+v; want %+v", got, want)
+	}
+}
+
+func TestCacheViewStats(t *testing.T) {
+	c := newViewCache(Options[string, any]{})
+	defer c.Close()
+
+	if got := c.ViewStats(); len(got) != 0 {
+		t.Fatalf("ViewStats before any view = %+v; want empty", got)
+	}
+
+	articles := NewView(c, ViewOptions[*article]{Name: "article"})
+	seasons := NewView(c, ViewOptions[*season]{Name: "season"})
+	if err := articles.Set("1", &article{id: "1"}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	articles.Get("1")
+	seasons.Get("1")
+	seasons.Get("2")
+
+	got := c.ViewStats()
+	if len(got) != 2 {
+		t.Fatalf("ViewStats has %d views; want 2: %+v", len(got), got)
+	}
+	if got["article"] != (ViewStats{Hits: 1}) {
+		t.Fatalf("article = %+v; want 1 hit", got["article"])
+	}
+	if got["season"] != (ViewStats{Misses: 2}) {
+		t.Fatalf("season = %+v; want 2 misses", got["season"])
+	}
+
+	// The snapshot is a copy: later lookups do not change it.
+	seasons.Get("3")
+	if got["season"].Misses != 2 {
+		t.Fatal("ViewStats snapshot changed after the fact")
+	}
+}
+
+// Views on different caches are different namespaces, so their counters are
+// apart even when the names match.
+func TestViewCountersBelongToTheirCache(t *testing.T) {
+	a := newViewCache(Options[string, any]{})
+	defer a.Close()
+	b := newViewCache(Options[string, any]{})
+	defer b.Close()
+
+	NewView(a, ViewOptions[int]{Name: "n"}).Get("1")
+
+	if got := b.ViewStats(); len(got) != 0 {
+		t.Fatalf("other cache ViewStats = %+v; want empty", got)
+	}
+	if got := NewView(b, ViewOptions[int]{Name: "n"}).Stats(); got != (ViewStats{}) {
+		t.Fatalf("view on other cache = %+v; want zero", got)
+	}
+}
+
 func TestViewRespectsDisableStats(t *testing.T) {
 	c := newViewCache(Options[string, any]{DisableStats: true})
 	defer c.Close()
@@ -277,6 +354,9 @@ func TestViewRespectsDisableStats(t *testing.T) {
 
 	if got := articles.Stats(); got != (ViewStats{}) {
 		t.Fatalf("view stats = %+v; want zero", got)
+	}
+	if got := c.ViewStats()["article"]; got != (ViewStats{}) {
+		t.Fatalf("cache view stats = %+v; want zero", got)
 	}
 }
 
