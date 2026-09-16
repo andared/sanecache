@@ -8,6 +8,10 @@ While the major version is 0, the public API may change in any release.
 
 ### Added
 
+- `NewView` accepts a nil cache and opens a view with caching switched off: `GetOrLoad`
+  runs the loader on every call, still coalescing concurrent callers, and keeps nothing.
+  Its lookups are misses, `Delete` reports false, and writes return the new `ErrDisabled`.
+  `NewView(nil, …)` used to panic.
 - `Cache.ViewStats`, a snapshot of the counters of every view opened on the cache, keyed
   by view name. An exporter no longer needs its own registry of views.
 

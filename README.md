@@ -278,6 +278,29 @@ the parent cache includes those events in its aggregate counters too.
 Counters belong to the view's name, not to the instance: views opened with the same name on
 the same cache share one set, as they share one set of keys.
 
+### Switching caching off
+
+A view opened on a nil cache stores nothing. It is for the configuration where a TTL of
+zero means "do not cache", so that the code calling `GetOrLoad` stays the same either way:
+
+```go
+var cache *sanecache.Cache[string, any]
+if ttl > 0 {
+    cache = shared
+}
+articles := sanecache.NewView(cache, sanecache.ViewOptions[*Article]{
+    Name:   "article",
+    TTL:    ttl,
+    Loader: fetchArticle,
+})
+```
+
+Such a view runs the loader on every call. Callers who arrive while a load is running still
+share it — turning the cache off should not turn off the protection of the upstream — but
+the result, `ErrNotFound` included, is not kept. Lookups are misses, `Delete` reports
+`false`, and writes return `ErrDisabled` rather than a success the next read would
+contradict. Its counters are its own and do not appear in any cache's `ViewStats`.
+
 ## The `Cost` function is the part worth getting right
 
 `MaxBytes` is only as honest as `Cost`. The number you want is resident size, and it is
