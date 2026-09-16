@@ -6,6 +6,18 @@ While the major version is 0, the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- `Cache.ViewStats`, a snapshot of the counters of every view opened on the cache, keyed
+  by view name. An exporter no longer needs its own registry of views.
+
+### Changed
+
+- View counters belong to the view name rather than the instance: views opened with the
+  same name on the same cache share one set of counters, as they already share keys.
+  `View.Stats` on either instance now reports both. Code that opened several instances of
+  one name and read their counters separately must read them as one.
+
 ## [0.4.0] - 2026-09-09
 
 ### Changed

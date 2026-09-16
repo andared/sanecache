@@ -76,7 +76,8 @@ type View[T any] struct {
 	loader  func(context.Context, string) (T, error)
 	flights []*flightGroup[string, T]
 
-	stats viewCounters
+	// stats is shared by every view of this name on this cache.
+	stats *viewCounters
 }
 
 // NewView opens a view named o.Name onto c. It panics on a name that cannot keep
@@ -102,6 +103,7 @@ func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 		ttl:         o.TTL,
 		negativeTTL: o.NegativeTTL,
 		countStats:  c.core.countStats,
+		stats:       c.core.viewCounters(o.Name),
 	}
 	if v.ttl == 0 {
 		v.ttl = c.core.ttl
@@ -193,18 +195,43 @@ func (v *View[T]) Delete(key string) bool {
 	return v.cache.Delete(v.prefix + key)
 }
 
-// Stats returns a snapshot of this view's counters. The cache's own Stats counts
-// the same lookups across every view.
+// Stats returns a snapshot of the counters for this view's name. Views opened
+// with the same name on the same cache share them, as they share the keys. The
+// cache's own Stats counts the same lookups across every view.
 func (v *View[T]) Stats() ViewStats {
-	return ViewStats{
-		Hits:       v.stats.hits.Load(),
-		Misses:     v.stats.misses.Load(),
-		Negatives:  v.stats.negatives.Load(),
-		TypeMisses: v.stats.typeMisses.Load(),
-		Loads:      v.stats.loads.Load(),
-		LoadErrors: v.stats.loadErrors.Load(),
-		Coalesced:  v.stats.coalesced.Load(),
+	return v.stats.snapshot()
+}
+
+// ViewStats returns a snapshot of the counters of every view opened on the
+// cache, by view name. It is what a metrics exporter polls: the cache knows its
+// views, so the application does not need a registry of its own.
+func (c *Cache[K, V]) ViewStats() map[string]ViewStats {
+	c.core.viewsMu.Lock()
+	defer c.core.viewsMu.Unlock()
+
+	stats := make(map[string]ViewStats, len(c.core.views))
+	for name, counters := range c.core.views {
+		stats[name] = counters.snapshot()
 	}
+
+	return stats
+}
+
+// viewCounters returns the counters for a view name, creating them on first use.
+func (c *core[K, V]) viewCounters(name string) *viewCounters {
+	c.viewsMu.Lock()
+	defer c.viewsMu.Unlock()
+
+	if c.views == nil {
+		c.views = make(map[string]*viewCounters)
+	}
+	counters, ok := c.views[name]
+	if !ok {
+		counters = new(viewCounters)
+		c.views[name] = counters
+	}
+
+	return counters
 }
 
 func (v *View[T]) valueCost(value T) int64 {
@@ -221,8 +248,8 @@ func (v *View[T]) count(c *atomic.Int64) {
 	}
 }
 
-// ViewStats is a snapshot of one view's counters, cumulative since the view was
-// opened.
+// ViewStats is a snapshot of the counters for one view name, cumulative since
+// the first view with that name was opened on the cache.
 type ViewStats struct {
 	Hits      int64 // lookups that returned a value of this view's type
 	Misses    int64 // lookups that found nothing
@@ -258,4 +285,16 @@ type viewCounters struct {
 	loads      atomic.Int64
 	loadErrors atomic.Int64
 	coalesced  atomic.Int64
+}
+
+func (c *viewCounters) snapshot() ViewStats {
+	return ViewStats{
+		Hits:       c.hits.Load(),
+		Misses:     c.misses.Load(),
+		Negatives:  c.negatives.Load(),
+		TypeMisses: c.typeMisses.Load(),
+		Loads:      c.loads.Load(),
+		LoadErrors: c.loadErrors.Load(),
+		Coalesced:  c.coalesced.Load(),
+	}
 }

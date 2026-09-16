@@ -237,7 +237,7 @@ seasons := sanecache.NewView(c, sanecache.ViewOptions[*Season]{
 a, ok := articles.Get(id) // a is a *Article, not an any
 ```
 
-A view fixes one value type, gives each of its own counters, and prefixes its keys with its
+A view fixes one value type, counts its own hits and misses, and prefixes its keys with its
 name, so two views cannot collide on the same id. It can bring its own `Cost` — which is
 what spares you the type switch that a shared `Cost func(any) int64` otherwise becomes — and
 its own TTLs. Eviction stays global: a view that suddenly needs more memory takes it from
@@ -274,6 +274,9 @@ independent loaders and flights, including instances with the same name; their s
 entries still share that namespace. The underlying cache's loader is independent and is
 never used as a fallback. `View.Stats()` includes `Loads`, `LoadErrors` and `Coalesced`;
 the parent cache includes those events in its aggregate counters too.
+
+Counters belong to the view's name, not to the instance: views opened with the same name on
+the same cache share one set, as they share one set of keys.
 
 ## The `Cost` function is the part worth getting right
 
@@ -369,6 +372,16 @@ s := c.Stats()
 // s.Hits, s.Misses, s.Negatives, s.TypeMisses, s.Evictions, s.Expirations,
 // s.Replacements, s.Rejections, s.Loads, s.LoadErrors, s.Coalesced,
 // s.Entries, s.Bytes, s.HitRate()
+```
+
+`ViewStats()` returns the same kind of snapshot for every view opened on the cache, keyed
+by view name, so an exporter needs no list of views of its own:
+
+```go
+for name, vs := range c.ViewStats() {
+    // vs.Hits, vs.Misses, vs.Negatives, vs.TypeMisses, vs.Loads, vs.LoadErrors,
+    // vs.Coalesced, vs.HitRate()
+}
 ```
 
 `Rejections` is the one to alert on: a steady nonzero rate means keys that can never be
