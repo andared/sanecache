@@ -54,7 +54,7 @@ With Go 1.24 or newer:
 
 ```sh
 go mod init example.com/cache-demo
-go get github.com/andared/sanecache@v0.4.0
+go get github.com/andared/sanecache@v0.5.0
 go run .
 ```
 
@@ -497,7 +497,7 @@ points of hit rate. It is a trade for caches whose access order is flat, not a f
 
 ## Status
 
-v0.3. The API above is what exists and is tested; expect it to move before v1.
+v0.5. The API above is what exists and is tested; expect it to move before v1.
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for what this
 library optimises for before proposing a change.
