@@ -2,6 +2,7 @@ package sanecache
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -575,4 +576,51 @@ func TestCoarseClockStopsWithTheCache(t *testing.T) {
 
 		return !ok
 	})
+}
+
+// A negative entry is charged what it actually holds. At a flat, small price a
+// flood of lookups for ids that do not exist would take far more memory than
+// the budget says.
+func TestNegativeEntryCost(t *testing.T) {
+	c := New(Options[string, int]{
+		NegativeTTL: time.Hour,
+		MaxBytes:    1 << 20,
+		Cost:        func(int) int64 { return 1 },
+	})
+	defer c.Close()
+
+	if err := c.SetNegative("k"); err != nil {
+		t.Fatalf("SetNegative: %v", err)
+	}
+	if got, want := c.Bytes(), entryOverhead+1; got != want {
+		t.Fatalf("Bytes = %d; want %d", got, want)
+	}
+
+	long := strings.Repeat("x", 100)
+	if err := c.SetNegative(long); err != nil {
+		t.Fatalf("SetNegative: %v", err)
+	}
+	if got, want := c.Bytes(), 2*entryOverhead+1+100; got != want {
+		t.Fatalf("Bytes = %d; want %d", got, want)
+	}
+
+	// Without a byte budget there is nothing to charge.
+	free := New(Options[string, int]{NegativeTTL: time.Hour})
+	defer free.Close()
+	if err := free.SetNegative(long); err != nil {
+		t.Fatalf("SetNegative: %v", err)
+	}
+	if free.Bytes() != 0 {
+		t.Fatalf("Bytes without Cost = %d; want 0", free.Bytes())
+	}
+
+	// Non-string keys are held inside the entry.
+	ints := New(Options[int, int]{NegativeTTL: time.Hour, MaxBytes: 1 << 20, Cost: func(int) int64 { return 1 }})
+	defer ints.Close()
+	if err := ints.SetNegative(7); err != nil {
+		t.Fatalf("SetNegative: %v", err)
+	}
+	if ints.Bytes() != entryOverhead {
+		t.Fatalf("int key Bytes = %d; want %d", ints.Bytes(), entryOverhead)
+	}
 }

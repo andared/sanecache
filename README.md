@@ -121,7 +121,8 @@ budget that silently counts entries.
 **"It does not exist" is an answer.** `SetNegative` records that the upstream was asked and
 said no. Without a first-class form for this, it ends up as a sentinel value smuggled
 inside your value type, which does not survive the type parameter and tends to be charged
-zero cost — making it the one thing eviction can never reclaim.
+zero cost — making it the one thing eviction can never reclaim. Under a byte budget a
+negative entry is charged what it holds: the entry, its map slot and its key.
 
 **TTLs can be jittered.** `Jitter: 10` spreads each expiry by up to ±10%. Keys warmed
 together by one request otherwise expire together and hit the upstream as one wave.

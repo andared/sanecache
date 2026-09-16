@@ -3,6 +3,7 @@ package sanecache
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
@@ -184,4 +185,39 @@ func BenchmarkClockBaseline(b *testing.B) {
 		sink = time.Now().UnixNano()
 	}
 	_ = sink
+}
+
+// BenchmarkNegativeEntryMemory measures what a negative entry really occupies,
+// less the bytes of its key, in a Cache[string, any]: the cache views run on,
+// and the one where "does not exist" answers pile up. entryOverhead is taken
+// from here: rerun this when the entry or the shard map changes.
+func BenchmarkNegativeEntryMemory(b *testing.B) {
+	for _, n := range []int{100_000, 150_000, 262_000} {
+		b.Run(strconv.Itoa(n), func(b *testing.B) {
+			keys := make([]string, n)
+			for i := range keys {
+				keys[i] = fmt.Sprintf("article:%016d", i)
+			}
+			var perEntry float64
+			for b.Loop() {
+				before := heapAlloc()
+				c := New(Options[string, any]{NegativeTTL: time.Hour, DisableCleanup: true})
+				for _, k := range keys {
+					_ = c.SetNegative(k)
+				}
+				perEntry = float64(heapAlloc()-before) / float64(n)
+				runtime.KeepAlive(c)
+			}
+			b.ReportMetric(perEntry, "bytes/entry")
+		})
+	}
+}
+
+func heapAlloc() uint64 {
+	runtime.GC()
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	return m.HeapAlloc
 }
