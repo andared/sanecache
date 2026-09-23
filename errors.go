@@ -29,7 +29,8 @@ var (
 	// next read cannot see.
 	ErrDisabled = errors.New("sanecache: the view has no cache to write to")
 
-	// ErrNoLoader is returned by GetOrLoad when the cache's Options.Loader or
-	// the view's ViewOptions.Loader was not set.
-	ErrNoLoader = errors.New("sanecache: GetOrLoad requires a loader (Options.Loader or ViewOptions.Loader)")
+	// ErrNoLoader is returned by GetOrLoad and GetManyOrLoad when the cache has
+	// neither Options.Loader nor Options.BatchLoader, or when the view's
+	// ViewOptions.Loader was not set.
+	ErrNoLoader = errors.New("sanecache: loading requires a loader (Options.Loader, Options.BatchLoader or ViewOptions.Loader)")
 )

@@ -18,8 +18,11 @@ type Stats struct {
 	// is what tells a namespace collision apart from a plain miss.
 	TypeMisses int64
 
-	Loads      int64 // Loader calls that finished, successfully or not
-	LoadErrors int64 // of those, the ones that returned an error
+	Loads      int64 // keys loaded by Loader or BatchLoader, successfully or not
+	LoadErrors int64 // of those, the ones that ended in an error
+	// Batches counts BatchLoader calls. Against Loads it says how many keys an
+	// upstream call carries on average.
+	Batches int64
 	// Coalesced counts the GetOrLoad calls that another caller's load spared
 	// from starting one of their own, whether they waited for it or arrived just
 	// after it published. Against Loads it says how much the single flight is
@@ -53,6 +56,7 @@ func (c *counters) addTo(s *Stats) {
 	s.Rejections += c.rejections.Load()
 	s.Loads += c.loads.Load()
 	s.LoadErrors += c.loadErrors.Load()
+	s.Batches += c.batches.Load()
 	s.Coalesced += c.coalesced.Load()
 }
 
@@ -67,5 +71,6 @@ type counters struct {
 	rejections   atomic.Int64
 	loads        atomic.Int64
 	loadErrors   atomic.Int64
+	batches      atomic.Int64
 	coalesced    atomic.Int64
 }

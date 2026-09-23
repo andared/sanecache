@@ -143,6 +143,20 @@ type Options[K comparable, V any] struct {
 	// another load's publication, keeps its result out of the cache.
 	Loader func(ctx context.Context, key K) (V, error)
 
+	// BatchLoader fetches several keys that are not cached in one call. It is
+	// what GetManyOrLoad calls with the keys nobody is loading yet, and what
+	// GetOrLoad calls with a single key when Loader is not set, so that a cache
+	// with an upstream answering many keys at once needs only this one loader.
+	//
+	// The result maps each key the upstream has to its value. A requested key
+	// missing from it means the upstream has no such key, the same answer as a
+	// Loader returning ErrNotFound; keys that were not requested are ignored. An
+	// error fails every key of the call, and is neither cached nor combined with
+	// whatever the map holds. The context follows Loader's rules, counting the
+	// waiters of every key in the call: it is cancelled once none of them is
+	// waiting for any key.
+	BatchLoader func(ctx context.Context, keys []K) (map[K]V, error)
+
 	// Shards splits the cache into independently locked parts, rounded up to a
 	// power of two. Zero and one both mean a single lock. More shards reduce
 	// contention but make the budget approximate: each shard gets an equal slice
@@ -208,8 +222,9 @@ type core[K comparable, V any] struct {
 	onEvict     func(K, V, EvictReason)
 	countStats  bool
 
-	loader  func(context.Context, K) (V, error)
-	flights []*flightGroup[K, V]
+	loader      func(context.Context, K) (V, error)
+	batchLoader func(context.Context, []K) (map[K]V, error)
+	flights     []*flightGroup[K, V]
 
 	// views holds one set of counters per view name. Views with the same name
 	// share a namespace in storage, so they share counters too; the map only
@@ -256,6 +271,10 @@ func New[K comparable, V any](o Options[K, V]) *Cache[K, V] {
 		onEvict:     o.OnEvict,
 		countStats:  !o.DisableStats,
 		loader:      o.Loader,
+		batchLoader: o.BatchLoader,
+	}
+	if cr.loader == nil && cr.batchLoader != nil {
+		cr.loader = cr.loadAsBatch
 	}
 
 	perBytes := divideBudget(o.MaxBytes, int64(n))
@@ -263,7 +282,7 @@ func New[K comparable, V any](o Options[K, V]) *Cache[K, V] {
 	for i := range cr.shards {
 		cr.shards[i] = newShard[K, V](perBytes, perEntries, o.Policy)
 	}
-	if o.Loader != nil {
+	if cr.loader != nil {
 		cr.flights = make([]*flightGroup[K, V], n)
 		for i := range cr.flights {
 			cr.flights[i] = newFlightGroup[K, V]()

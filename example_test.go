@@ -164,6 +164,51 @@ func ExampleCache_GetOrLoad() {
 	// upstream calls: 2
 }
 
+// Fetching many keys from an upstream that answers many at once: one call for
+// whatever the cache does not already hold.
+func ExampleCache_GetManyOrLoad() {
+	var upstreamCalls atomic.Int64
+
+	c := sanecache.New(sanecache.Options[string, *article]{
+		TTL:         time.Minute,
+		NegativeTTL: 10 * time.Second,
+		BatchLoader: func(_ context.Context, ids []string) (map[string]*article, error) {
+			upstreamCalls.Add(1)
+			// One round trip, say SELECT ... WHERE id IN (...). A requested id
+			// missing from the answer is an id the upstream does not have.
+			found := make(map[string]*article, len(ids))
+			for _, id := range ids {
+				if id != "gone" {
+					found[id] = &article{ID: id, Body: "hello"}
+				}
+			}
+
+			return found, nil
+		},
+	})
+	defer c.Close()
+
+	if err := c.Set("a1", &article{ID: "a1", Body: "cached"}); err != nil {
+		fmt.Println("set:", err)
+		return
+	}
+
+	got, err := c.GetManyOrLoad(context.Background(), []string{"a1", "a2", "a3", "gone"})
+	if err != nil {
+		fmt.Println("load:", err)
+		return
+	}
+	fmt.Println("found:", len(got), got["a1"].Body, got["a2"].Body)
+
+	// The same batch again is answered from the cache, "gone" included.
+	_, _ = c.GetManyOrLoad(context.Background(), []string{"a1", "a2", "a3", "gone"})
+	fmt.Println("upstream calls:", upstreamCalls.Load())
+
+	// Output:
+	// found: 3 cached hello
+	// upstream calls: 1
+}
+
 // Several value types under one byte budget, which is the only kind of budget
 // that does not need dividing up in advance.
 func ExampleNewView() {

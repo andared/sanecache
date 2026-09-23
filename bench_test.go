@@ -145,6 +145,52 @@ func BenchmarkGetOrLoad(b *testing.B) {
 	}
 }
 
+// BenchmarkGetManyOrLoad is the warm path of a batch: every key is cached, so
+// the loader never runs and what is measured is the lookup of the batch and the
+// map it comes back in, against the same keys fetched one GetOrLoad at a time.
+func BenchmarkGetManyOrLoad(b *testing.B) {
+	const batch = 16
+	c := New(Options[int, int]{
+		TTL:      time.Hour,
+		MaxBytes: benchKeys,
+		Cost:     unitCost[int](),
+		BatchLoader: func(_ context.Context, keys []int) (map[int]int, error) {
+			out := make(map[int]int, len(keys))
+			for _, k := range keys {
+				out[k] = k
+			}
+
+			return out, nil
+		},
+	})
+	defer c.Close()
+	for i := range benchKeys {
+		_ = c.Set(i, i)
+	}
+	keys := make([]int, batch)
+	ctx := context.Background()
+
+	b.Run("batch", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := range b.N {
+			for j := range keys {
+				keys[j] = (i*batch + j) % benchKeys
+			}
+			_, _ = c.GetManyOrLoad(ctx, keys)
+		}
+	})
+	b.Run("one-by-one", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := range b.N {
+			out := make(map[int]int, batch)
+			for j := range keys {
+				k := (i*batch + j) % benchKeys
+				out[k], _ = c.GetOrLoad(ctx, k)
+			}
+		}
+	})
+}
+
 // BenchmarkView is what a typed view costs over the cache underneath it: one
 // concatenation to namespace the key, and one type assertion on the way out.
 func BenchmarkView(b *testing.B) {

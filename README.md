@@ -54,7 +54,7 @@ With Go 1.24 or newer:
 
 ```sh
 go mod init example.com/cache-demo
-go get github.com/andared/sanecache@v0.5.0
+go get github.com/andared/sanecache@v0.6.0
 go run .
 ```
 
@@ -210,6 +210,54 @@ only for active loads; deleted keys do not leave permanent metadata behind.
 `Clear` visits shards individually, so it is not an atomic snapshot or a pause on traffic.
 New loads and writes may repopulate a shard after it has been cleared. `Close` still only
 stops maintenance goroutines; it does not invalidate entries or cancel loaders.
+
+## Loading many keys at once
+
+When the upstream answers many keys in one call — a query with `IN`, a pipelined round
+trip — loading them one `GetOrLoad` at a time turns one request into as many upstream
+calls as there are keys. `GetManyOrLoad` looks every key up and sends the ones the cache
+does not hold to a `BatchLoader` in one call:
+
+```go
+c := sanecache.New(sanecache.Options[int, *Article]{
+    TTL:         10 * time.Minute,
+    NegativeTTL: 30 * time.Second,
+    BatchLoader: func(ctx context.Context, ids []int) (map[int]*Article, error) {
+        return db.ArticlesByIDs(ctx, ids) // an id missing from the map does not exist
+    },
+})
+
+articles, err := c.GetManyOrLoad(ctx, ids) // cached or loaded; absent ids are not in it
+```
+
+It keeps the guarantees of `GetOrLoad`, key by key rather than batch by batch:
+
+**Single flight covers each key.** A key that another `GetOrLoad` or `GetManyOrLoad` is
+already loading is waited for, not loaded again, so overlapping batches send the upstream
+only the keys nobody has asked for yet. A `GetOrLoad` for a key that is part of a running
+batch waits for the batch.
+
+**"Does not exist" is a key missing from the answer.** It is cached as a negative entry,
+as `ErrNotFound` from a `Loader` would be, and it is not an error: the key is simply absent
+from the result.
+
+**A failed batch fails whole.** An error from the loader is returned for every key it was
+asked for and nothing from that call is cached, including whatever the map held alongside
+the error. Keys that were already cached, or that other loads supplied, are still returned
+with it.
+
+**The upstream call lives as long as somebody wants any of it.** Its context is cancelled
+once no caller is waiting for any of its keys, so a caller who gives up on part of a batch
+does not cancel it for another caller who needs a different part.
+
+**Invalidation is per key.** A `Delete` or a successful write of one key during the batch
+keeps that key's result out of the cache and leaves the rest of the batch alone.
+
+With only a `BatchLoader`, `GetOrLoad` uses it with a batch of one, so a cache needs a
+single loader for both. With only a `Loader`, `GetManyOrLoad` loads the missing keys
+concurrently, one call each. `Stats().Batches` counts `BatchLoader` calls; against
+`Loads`, which counts keys, it says how many keys an upstream call carries. Batch loading
+is not available on views yet.
 
 ## Several value types under one budget
 
@@ -394,7 +442,7 @@ metrics interval and export it however you like:
 ```go
 s := c.Stats()
 // s.Hits, s.Misses, s.Negatives, s.TypeMisses, s.Evictions, s.Expirations,
-// s.Replacements, s.Rejections, s.Loads, s.LoadErrors, s.Coalesced,
+// s.Replacements, s.Rejections, s.Loads, s.LoadErrors, s.Coalesced, s.Batches,
 // s.Entries, s.Bytes, s.HitRate()
 ```
 
@@ -497,7 +545,7 @@ points of hit rate. It is a trade for caches whose access order is flat, not a f
 
 ## Status
 
-v0.5. The API above is what exists and is tested; expect it to move before v1.
+v0.6. The API above is what exists and is tested; expect it to move before v1.
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for what this
 library optimises for before proposing a change.

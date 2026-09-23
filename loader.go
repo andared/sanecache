@@ -8,7 +8,8 @@ import (
 	"sync"
 )
 
-// GetOrLoad returns the cached value, calling Options.Loader when there is none.
+// GetOrLoad returns the cached value, calling Options.Loader when there is none,
+// or Options.BatchLoader with this one key when there is no Loader.
 // Callers that ask for the same key while a load is running wait for it instead
 // of starting their own, so a cold key costs one upstream call rather than one
 // per concurrent caller.

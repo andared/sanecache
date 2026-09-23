@@ -6,6 +6,30 @@ While the major version is 0, the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-23
+
+### Added
+
+- `Options.BatchLoader` and `Cache.GetManyOrLoad`: the keys a batch does not find in the
+  cache are loaded in one call. Single flight, invalidation and cancellation work per key,
+  so batches and `GetOrLoad` calls that overlap share loads instead of repeating them. A
+  requested key missing from the loader's answer is cached as "does not exist"; an error
+  fails the whole call and nothing from it is cached.
+- `GetOrLoad` falls back to `BatchLoader` with one key when `Loader` is not set, and
+  `GetManyOrLoad` falls back to concurrent `Loader` calls when `BatchLoader` is not set.
+- `Stats.Batches`, the number of `BatchLoader` calls.
+
+### Changed
+
+- `Stats.Loads` and `Stats.LoadErrors` count keys rather than loader calls. For `Loader`
+  the two are the same; for a batch they are not, and counting keys keeps `Coalesced`
+  comparable with `Loads`. Use `Batches` for the number of batch calls.
+- The text of `ErrNoLoader` names `Options.BatchLoader` too. Compare with `errors.Is`.
+
+### Not yet
+
+- Views have no batch loading; `ViewOptions` is unchanged.
+
 ## [0.5.0] - 2026-09-16
 
 ### Added
@@ -129,7 +153,8 @@ First cut.
 - Built-in counters via `Stats`, and an `OnEvict` callback carrying a reason.
 - `ErrTooLarge` from `Set` for values that can never fit.
 
-[Unreleased]: https://github.com/andared/sanecache/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/andared/sanecache/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/andared/sanecache/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/andared/sanecache/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/andared/sanecache/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/andared/sanecache/compare/v0.2.0...v0.3.0
