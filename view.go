@@ -106,9 +106,7 @@ func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 			prefix:     o.Name + viewSeparator,
 			countStats: true,
 			stats:      new(viewCounters),
-		}
-		if v.loader != nil {
-			v.flights = []*flightGroup[string, T]{newFlightGroup[string, T]()}
+			flights:    []*flightGroup[string, T]{newFlightGroup[string, T]()},
 		}
 
 		return v
@@ -132,11 +130,10 @@ func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 		v.negativeTTL = c.core.negativeTTL
 	}
 
-	if v.loader != nil {
-		v.flights = make([]*flightGroup[string, T], len(c.core.shards))
-		for i := range v.flights {
-			v.flights[i] = newFlightGroup[string, T]()
-		}
+	// Made with or without a view loader: GetOrLoadFunc brings its own.
+	v.flights = make([]*flightGroup[string, T], len(c.core.shards))
+	for i := range v.flights {
+		v.flights[i] = newFlightGroup[string, T]()
 	}
 
 	return v

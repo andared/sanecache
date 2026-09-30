@@ -166,6 +166,43 @@ func ExampleCache_GetOrLoad() {
 
 // Fetching many keys from an upstream that answers many at once: one call for
 // whatever the cache does not already hold.
+// A search page is cached under a key that only summarises the query. The request
+// itself travels with the call instead of being parsed back out of the key.
+func ExampleCache_GetOrLoadFunc() {
+	type query struct {
+		Text string
+		Page int
+	}
+	var upstreamCalls atomic.Int64
+	search := func(_ context.Context, q query) ([]string, error) {
+		upstreamCalls.Add(1)
+
+		return []string{fmt.Sprintf("%s, page %d", q.Text, q.Page)}, nil
+	}
+
+	c := sanecache.New(sanecache.Options[string, []string]{TTL: time.Minute})
+	defer c.Close()
+
+	q := query{Text: "sanecache", Page: 2}
+	key := fmt.Sprintf("%s|%d", q.Text, q.Page)
+	for range 3 {
+		results, err := c.GetOrLoadFunc(context.Background(), key, func(ctx context.Context) ([]string, error) {
+			return search(ctx, q)
+		})
+		if err != nil {
+			fmt.Println("search:", err)
+		}
+		fmt.Println(results[0])
+	}
+	fmt.Println("upstream calls:", upstreamCalls.Load())
+
+	// Output:
+	// sanecache, page 2
+	// sanecache, page 2
+	// sanecache, page 2
+	// upstream calls: 1
+}
+
 func ExampleCache_GetManyOrLoad() {
 	var upstreamCalls atomic.Int64
 

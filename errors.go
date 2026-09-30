@@ -31,6 +31,6 @@ var (
 
 	// ErrNoLoader is returned by GetOrLoad and GetManyOrLoad when the cache has
 	// neither Options.Loader nor Options.BatchLoader, or when the view's
-	// ViewOptions.Loader was not set.
+	// ViewOptions.Loader was not set, and by GetOrLoadFunc given a nil function.
 	ErrNoLoader = errors.New("sanecache: loading requires a loader (Options.Loader, Options.BatchLoader or ViewOptions.Loader)")
 )

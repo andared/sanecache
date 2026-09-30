@@ -13,29 +13,67 @@ import (
 // Without a view loader it returns ErrNoLoader, even for a cached key; the
 // underlying cache's loader is never used. Loads coalesce per View instance.
 func (v *View[T]) GetOrLoad(ctx context.Context, key string) (T, error) {
-	var zero T
 	if v.loader == nil {
+		var zero T
+
 		return zero, ErrNoLoader
 	}
-	switch val, st := v.Lookup(key); st {
-	case StatusHit:
-		return val, nil
-	case StatusNegative:
-		return zero, ErrNotFound
-	}
-	if err := ctx.Err(); err != nil {
-		return zero, err
-	}
-	if v.cache == nil {
-		return v.loadUncached(ctx, key)
+
+	if val, done, err := v.cached(ctx, key); done {
+		return val, err
 	}
 
-	return v.load(ctx, key)
+	return v.loadWith(ctx, key, v.loader)
+}
+
+// GetOrLoadFunc is GetOrLoad with the loader passed by the caller instead of
+// taken from ViewOptions, as Cache.GetOrLoadFunc is for the cache. Results are
+// stored with this view's Cost and TTLs. Loads are shared with this View
+// instance's GetOrLoad, so load must produce what the view's loader, or any
+// other caller's function, would for that key.
+//
+// ViewOptions.Loader is not needed. A nil load returns ErrNoLoader. On a view
+// with caching switched off, load runs on every call that does not find one
+// already running.
+func (v *View[T]) GetOrLoadFunc(ctx context.Context, key string, load func(context.Context) (T, error)) (T, error) {
+	if load == nil {
+		var zero T
+
+		return zero, ErrNoLoader
+	}
+	if val, done, err := v.cached(ctx, key); done {
+		return val, err
+	}
+
+	return v.loadWith(ctx, key, func(ctx context.Context, _ string) (T, error) { return load(ctx) })
+}
+
+// cached is Cache.cached for a view.
+func (v *View[T]) cached(ctx context.Context, key string) (val T, done bool, err error) {
+	switch val, st := v.Lookup(key); st {
+	case StatusHit:
+		return val, true, nil
+	case StatusNegative:
+		return val, true, ErrNotFound
+	}
+	if err := ctx.Err(); err != nil {
+		return val, true, err
+	}
+
+	return val, false, nil
+}
+
+func (v *View[T]) loadWith(ctx context.Context, key string, loader func(context.Context, string) (T, error)) (T, error) {
+	if v.cache == nil {
+		return v.loadUncached(ctx, key, loader)
+	}
+
+	return v.load(ctx, key, loader)
 }
 
 // loadUncached is load for a view without a cache: callers still share one call
 // while it runs, but its result, "does not exist" included, is not kept.
-func (v *View[T]) loadUncached(ctx context.Context, key string) (T, error) {
+func (v *View[T]) loadUncached(ctx context.Context, key string, loader func(context.Context, string) (T, error)) (T, error) {
 	g := v.flights[0]
 
 	g.mu.Lock()
@@ -52,13 +90,13 @@ func (v *View[T]) loadUncached(ctx context.Context, key string) (T, error) {
 	g.mu.Unlock()
 
 	go g.run(key, cl, func() (T, error) {
-		return v.loader(loadCtx, key)
+		return loader(loadCtx, key)
 	}, v.countLoad)
 
 	return g.wait(ctx, key, cl)
 }
 
-func (v *View[T]) load(ctx context.Context, key string) (T, error) {
+func (v *View[T]) load(ctx context.Context, key string, loader func(context.Context, string) (T, error)) (T, error) {
 	c := v.cache.core
 	fullKey := v.prefix + key
 	idx := c.shardIndex(fullKey)
@@ -101,7 +139,7 @@ func (v *View[T]) load(ctx context.Context, key string) (T, error) {
 	go func() {
 		defer s.endLoad(fullKey, token)
 		g.run(key, cl, func() (T, error) {
-			value, err := v.loader(loadCtx, key)
+			value, err := loader(loadCtx, key)
 			switch {
 			case err == nil:
 				_ = c.setValue(fullKey, value, v.valueCost(value), v.ttl, token)
