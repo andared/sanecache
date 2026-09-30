@@ -24,26 +24,63 @@ import (
 // Errors other than ErrNotFound are returned as the loader produced them and are
 // not cached, so the next call tries again.
 func (c *Cache[K, V]) GetOrLoad(ctx context.Context, key K) (V, error) {
-	var zero V
-
 	if c.core.loader == nil {
+		var zero V
+
 		return zero, ErrNoLoader
 	}
+	if v, done, err := c.cached(ctx, key); done {
+		return v, err
+	}
 
+	return c.core.load(ctx, key, c.core.loader)
+}
+
+// GetOrLoadFunc is GetOrLoad with the loader passed by the caller instead of
+// taken from Options. It is for upstream calls that need more than the key to
+// make — the parameters a key only summarises, a request the caller has already
+// built — which a loader would otherwise have to parse back out of the key.
+//
+// Everything else is GetOrLoad's: single flight, storage with the cache's Cost
+// and TTLs, ErrNotFound kept as a negative entry, the error, cancellation and
+// panic policies, and the counters. A load for the key already running, whether
+// GetOrLoad, GetManyOrLoad or another GetOrLoadFunc started it, is waited for
+// rather than repeated. That is the one rule the method adds: callers of a key
+// share whichever load started first, so load must produce what any other
+// caller's function would for that key.
+//
+// Options.Loader and Options.BatchLoader are not needed. A nil load returns
+// ErrNoLoader.
+func (c *Cache[K, V]) GetOrLoadFunc(ctx context.Context, key K, load func(context.Context) (V, error)) (V, error) {
+	if load == nil {
+		var zero V
+
+		return zero, ErrNoLoader
+	}
+	if v, done, err := c.cached(ctx, key); done {
+		return v, err
+	}
+
+	return c.core.load(ctx, key, func(ctx context.Context, _ K) (V, error) { return load(ctx) })
+}
+
+// cached answers a load from the cache when it can. done is false only when the
+// key is a miss and the caller still has time to wait for a load.
+func (c *Cache[K, V]) cached(ctx context.Context, key K) (v V, done bool, err error) {
 	switch v, st := c.Lookup(key); st {
 	case StatusHit:
-		return v, nil
+		return v, true, nil
 	case StatusNegative:
-		return zero, ErrNotFound
+		return v, true, ErrNotFound
 	}
 
 	// Checked after the lookup: a cached answer is worth having even to a caller
 	// who has already run out of time, and costs nothing to give.
 	if err := ctx.Err(); err != nil {
-		return zero, err
+		return v, true, err
 	}
 
-	return c.core.load(ctx, key)
+	return v, false, nil
 }
 
 // call is one load in flight. Waiters read val and err only after done is
@@ -74,7 +111,7 @@ func newFlightGroup[K comparable, V any]() *flightGroup[K, V] {
 	return &flightGroup[K, V]{calls: make(map[K]*call[V])}
 }
 
-func (c *core[K, V]) load(ctx context.Context, key K) (V, error) {
+func (c *core[K, V]) load(ctx context.Context, key K, loader func(context.Context, K) (V, error)) (V, error) {
 	idx := c.shardIndex(key)
 	g, s := c.flights[idx], c.shards[idx]
 
@@ -117,7 +154,7 @@ func (c *core[K, V]) load(ctx context.Context, key K) (V, error) {
 	g.calls[key] = cl
 	g.mu.Unlock()
 
-	go c.run(loadCtx, g, s, key, cl)
+	go c.run(loadCtx, g, s, key, cl, loader)
 
 	return g.wait(ctx, key, cl)
 }
@@ -130,10 +167,12 @@ func (c *core[K, V]) countCoalesced(s *shard[K, V]) {
 
 // run performs the load and publishes the result. It runs on its own goroutine
 // so that a caller can walk away from a load without ending it.
-func (c *core[K, V]) run(ctx context.Context, g *flightGroup[K, V], s *shard[K, V], key K, cl *call[V]) {
+func (c *core[K, V]) run(
+	ctx context.Context, g *flightGroup[K, V], s *shard[K, V], key K, cl *call[V], loader func(context.Context, K) (V, error),
+) {
 	defer s.endLoad(key, cl.token)
 	g.run(key, cl, func() (V, error) {
-		v, err := c.loader(ctx, key)
+		v, err := loader(ctx, key)
 		switch {
 		case err == nil:
 			_ = c.setValue(key, v, c.valueCost(v), c.ttl, cl.token)

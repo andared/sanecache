@@ -282,11 +282,10 @@ func New[K comparable, V any](o Options[K, V]) *Cache[K, V] {
 	for i := range cr.shards {
 		cr.shards[i] = newShard[K, V](perBytes, perEntries, o.Policy)
 	}
-	if cr.loader != nil {
-		cr.flights = make([]*flightGroup[K, V], n)
-		for i := range cr.flights {
-			cr.flights[i] = newFlightGroup[K, V]()
-		}
+	// Made with or without a loader in Options: GetOrLoadFunc brings its own.
+	cr.flights = make([]*flightGroup[K, V], n)
+	for i := range cr.flights {
+		cr.flights[i] = newFlightGroup[K, V]()
 	}
 	if o.ClockGranularity > 0 {
 		// Seeded here rather than on the first tick: a lookup between New and

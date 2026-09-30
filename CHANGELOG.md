@@ -6,8 +6,14 @@ While the major version is 0, the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-30
+
 ### Added
 
+- `Cache.GetOrLoadFunc` and `View.GetOrLoadFunc`: `GetOrLoad` with the loader passed in by
+  the caller, for upstream calls that need more than the key to make. Loads are shared with
+  `GetOrLoad` and `GetManyOrLoad` of the same key, so callers of one key wait for whichever
+  load started first. `Options.Loader` and `ViewOptions.Loader` are not needed for it.
 - `Stats.LoadNotFound` and `ViewStats.LoadNotFound`: loads that ended in `ErrNotFound`,
   including keys missing from a `BatchLoader` answer.
 
@@ -165,7 +171,8 @@ First cut.
 - Built-in counters via `Stats`, and an `OnEvict` callback carrying a reason.
 - `ErrTooLarge` from `Set` for values that can never fit.
 
-[Unreleased]: https://github.com/andared/sanecache/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/andared/sanecache/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/andared/sanecache/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/andared/sanecache/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/andared/sanecache/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/andared/sanecache/compare/v0.3.0...v0.4.0

@@ -120,7 +120,7 @@ func TestLoadRechecksTheCacheBeforeStartingOver(t *testing.T) {
 	if err := c.Set("k", 7); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	v, err := c.core.load(context.Background(), "k")
+	v, err := c.core.load(context.Background(), "k", c.core.loader)
 	if err != nil || v != 7 {
 		t.Fatalf("load = %v, %v; want 7, nil", v, err)
 	}
@@ -129,7 +129,7 @@ func TestLoadRechecksTheCacheBeforeStartingOver(t *testing.T) {
 	if err := c.SetNegative("gone"); err != nil {
 		t.Fatalf("SetNegative: %v", err)
 	}
-	if _, err := c.core.load(context.Background(), "gone"); !errors.Is(err, ErrNotFound) {
+	if _, err := c.core.load(context.Background(), "gone", c.core.loader); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("err = %v; want ErrNotFound", err)
 	}
 

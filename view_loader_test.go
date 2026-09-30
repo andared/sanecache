@@ -78,13 +78,13 @@ func TestViewLoaderPolicies(t *testing.T) {
 			if c.Bytes() != 5 {
 				t.Fatalf("view cost: %d", c.Bytes())
 			}
-			if got, err := v.load(ctx, "k"); got != "hello" || err != nil || calls != 1 {
+			if got, err := v.load(ctx, "k", v.loader); got != "hello" || err != nil || calls != 1 {
 				t.Fatalf("recheck: %q, %v, calls %d", got, err, calls)
 			}
 			if _, err := v.GetOrLoad(ctx, "gone"); !errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), "missing") {
 				t.Fatalf("not found: %v", err)
 			}
-			if _, err := v.load(ctx, "gone"); err != ErrNotFound {
+			if _, err := v.load(ctx, "gone", v.loader); err != ErrNotFound {
 				t.Fatalf("negative recheck: %v", err)
 			}
 			if _, err := v.GetOrLoad(ctx, "gone"); err != ErrNotFound {

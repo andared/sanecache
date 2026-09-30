@@ -54,7 +54,7 @@ With Go 1.24 or newer:
 
 ```sh
 go mod init example.com/cache-demo
-go get github.com/andared/sanecache@v0.6.0
+go get github.com/andared/sanecache@v0.7.0
 go run .
 ```
 
@@ -187,6 +187,23 @@ deadline of its own should set one inside the loader, where the right number is 
 A load with no caller left is cancelled. A loader that ignores cancellation can still
 warm the cache, provided its result has not been superseded by an explicit invalidation
 or a successful write, including another loader's publication.
+
+### When the loader needs more than the key
+
+A loader in `Options` gets the key and nothing else. When the upstream call needs more — a
+query string the key only summarises, a request the caller has already built — the choice
+is between encoding all of it into the key and parsing it back out in the loader, or
+passing the loader in with the call:
+
+```go
+page, err := c.GetOrLoadFunc(ctx, pageKey(path, params), func(ctx context.Context) (*Page, error) {
+    return fetchPage(ctx, path, params)
+})
+```
+
+It is `GetOrLoad` in every other respect, and shares loads with it: callers of one key wait
+for whichever load started first, so the function must return what any other caller's would
+for that key. Views have `GetOrLoadFunc` too. Neither needs a loader in the options.
 
 ## Invalidation while loading
 

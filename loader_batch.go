@@ -80,7 +80,7 @@ func (c *Cache[K, V]) GetManyOrLoad(ctx context.Context, keys []K) (map[K]V, err
 		go cr.runBatch(batch.ctx, batch.cancel, fresh)
 	default:
 		for _, f := range fresh {
-			go cr.run(f.ctx, f.g, f.s, f.key, f.cl)
+			go cr.run(f.ctx, f.g, f.s, f.key, f.cl, cr.loader)
 		}
 	}
 
