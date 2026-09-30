@@ -321,7 +321,7 @@ a typed load. With no view loader, `GetOrLoad` returns `ErrNoLoader` even for a 
 Reuse the same `View` instance to share in-flight loads. Separate instances have
 independent loaders and flights, including instances with the same name; their stored
 entries still share that namespace. The underlying cache's loader is independent and is
-never used as a fallback. `View.Stats()` includes `Loads`, `LoadErrors` and `Coalesced`;
+never used as a fallback. `View.Stats()` includes `Loads`, `LoadNotFound`, `LoadErrors` and `Coalesced`;
 the parent cache includes those events in its aggregate counters too.
 
 Counters belong to the view's name, not to the instance: views opened with the same name on
@@ -442,7 +442,7 @@ metrics interval and export it however you like:
 ```go
 s := c.Stats()
 // s.Hits, s.Misses, s.Negatives, s.TypeMisses, s.Evictions, s.Expirations,
-// s.Replacements, s.Rejections, s.Loads, s.LoadErrors, s.Coalesced, s.Batches,
+// s.Replacements, s.Rejections, s.Loads, s.LoadNotFound, s.LoadErrors, s.Coalesced, s.Batches,
 // s.Entries, s.Bytes, s.HitRate()
 ```
 
@@ -451,15 +451,17 @@ by view name, so an exporter needs no list of views of its own:
 
 ```go
 for name, vs := range c.ViewStats() {
-    // vs.Hits, vs.Misses, vs.Negatives, vs.TypeMisses, vs.Loads, vs.LoadErrors,
-    // vs.Coalesced, vs.HitRate()
+    // vs.Hits, vs.Misses, vs.Negatives, vs.TypeMisses, vs.Loads, vs.LoadNotFound,
+    // vs.LoadErrors, vs.Coalesced, vs.HitRate()
 }
 ```
 
 `Rejections` is the one to alert on: a steady nonzero rate means keys that can never be
 cached. `Coalesced` against `Loads` says how much work the single-flight is actually saving
-— if they are equal, the cache is cold in a way worth looking at. `OnEvict` is available
-separately when entries hold resources that need releasing.
+— if they are equal, the cache is cold in a way worth looking at. `LoadErrors` counts loads
+that failed; a loader answering `ErrNotFound` did not fail, and is counted in `LoadNotFound`
+instead, so an error rate built on `LoadErrors` is not inflated by ids that are simply gone.
+`OnEvict` is available separately when entries hold resources that need releasing.
 
 ## Lifecycle
 

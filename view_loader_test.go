@@ -117,7 +117,7 @@ func TestViewLoaderPolicies(t *testing.T) {
 				}
 			} else {
 				vs, cs := v.Stats(), c.Stats()
-				if vs.Loads != 5 || vs.LoadErrors != 3 || cs.Loads != vs.Loads || cs.LoadErrors != vs.LoadErrors || cs.Rejections != 1 || vs.TypeMisses != 1 {
+				if vs.Loads != 5 || vs.LoadNotFound != 1 || vs.LoadErrors != 2 || cs.Loads != vs.Loads || cs.LoadNotFound != vs.LoadNotFound || cs.LoadErrors != vs.LoadErrors || cs.Rejections != 1 || vs.TypeMisses != 1 {
 					t.Fatalf("stats: %+v / %+v", vs, cs)
 				}
 			}

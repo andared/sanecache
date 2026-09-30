@@ -286,6 +286,16 @@ func (v *View[T]) count(c *atomic.Int64) {
 	}
 }
 
+func (v *View[T]) countLoad(o loadOutcome) {
+	v.count(&v.stats.loads)
+	switch o {
+	case loadNotFound:
+		v.count(&v.stats.loadNotFound)
+	case loadFailed:
+		v.count(&v.stats.loadErrors)
+	}
+}
+
 // ViewStats is a snapshot of the counters for one view name, cumulative since
 // the first view with that name was opened on the cache.
 type ViewStats struct {
@@ -299,9 +309,10 @@ type ViewStats struct {
 	// made straight to the underlying cache.
 	TypeMisses int64
 
-	Loads      int64 // completed loader calls, including errors and panics
-	LoadErrors int64 // completed loader calls that failed
-	Coalesced  int64 // calls spared a load by another caller
+	Loads        int64 // completed loader calls, including errors and panics
+	LoadNotFound int64 // completed loader calls that returned ErrNotFound
+	LoadErrors   int64 // completed loader calls that failed otherwise, or panicked
+	Coalesced    int64 // calls spared a load by another caller
 }
 
 // HitRate reports hits as a fraction of all lookups, counting a cached negative
@@ -316,23 +327,25 @@ func (s ViewStats) HitRate() float64 {
 }
 
 type viewCounters struct {
-	hits       atomic.Int64
-	misses     atomic.Int64
-	negatives  atomic.Int64
-	typeMisses atomic.Int64
-	loads      atomic.Int64
-	loadErrors atomic.Int64
-	coalesced  atomic.Int64
+	hits         atomic.Int64
+	misses       atomic.Int64
+	negatives    atomic.Int64
+	typeMisses   atomic.Int64
+	loads        atomic.Int64
+	loadNotFound atomic.Int64
+	loadErrors   atomic.Int64
+	coalesced    atomic.Int64
 }
 
 func (c *viewCounters) snapshot() ViewStats {
 	return ViewStats{
-		Hits:       c.hits.Load(),
-		Misses:     c.misses.Load(),
-		Negatives:  c.negatives.Load(),
-		TypeMisses: c.typeMisses.Load(),
-		Loads:      c.loads.Load(),
-		LoadErrors: c.loadErrors.Load(),
-		Coalesced:  c.coalesced.Load(),
+		Hits:         c.hits.Load(),
+		Misses:       c.misses.Load(),
+		Negatives:    c.negatives.Load(),
+		TypeMisses:   c.typeMisses.Load(),
+		Loads:        c.loads.Load(),
+		LoadNotFound: c.loadNotFound.Load(),
+		LoadErrors:   c.loadErrors.Load(),
+		Coalesced:    c.coalesced.Load(),
 	}
 }

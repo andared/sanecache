@@ -205,10 +205,7 @@ func (c *core[K, V]) runBatch(ctx context.Context, cancel context.CancelFunc, fr
 		if c.countStats {
 			fresh[0].s.counters.batches.Add(1)
 			for _, f := range fresh {
-				f.s.counters.loads.Add(1)
-				if f.cl.err != nil || f.cl.pan != nil {
-					f.s.counters.loadErrors.Add(1)
-				}
+				f.s.counters.countLoad(outcomeOf(f.cl.err, f.cl.pan))
 			}
 		}
 		for _, f := range fresh {

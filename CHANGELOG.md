@@ -6,6 +6,18 @@ While the major version is 0, the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- `Stats.LoadNotFound` and `ViewStats.LoadNotFound`: loads that ended in `ErrNotFound`,
+  including keys missing from a `BatchLoader` answer.
+
+### Changed
+
+- `LoadErrors` no longer counts loads that ended in `ErrNotFound`. "Does not exist" is an
+  answer, and counting it as a failure made a service that asks for ids that are gone look
+  broken on every dashboard built on `LoadErrors`. Those loads are in `LoadNotFound` now;
+  `LoadErrors + LoadNotFound` is what `LoadErrors` used to report.
+
 ## [0.6.0] - 2026-09-23
 
 ### Added

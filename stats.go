@@ -18,8 +18,12 @@ type Stats struct {
 	// is what tells a namespace collision apart from a plain miss.
 	TypeMisses int64
 
-	Loads      int64 // keys loaded by Loader or BatchLoader, successfully or not
-	LoadErrors int64 // of those, the ones that ended in an error
+	Loads int64 // keys loaded by Loader or BatchLoader, successfully or not
+	// LoadNotFound counts the loads that ended in ErrNotFound, a key missing
+	// from a batch answer included. It is an answer rather than a failure, so
+	// LoadErrors does not count it.
+	LoadNotFound int64
+	LoadErrors   int64 // loads that failed: any other error, or a panic
 	// Batches counts BatchLoader calls. Against Loads it says how many keys an
 	// upstream call carries on average.
 	Batches int64
@@ -55,9 +59,21 @@ func (c *counters) addTo(s *Stats) {
 	s.Replacements += c.replacements.Load()
 	s.Rejections += c.rejections.Load()
 	s.Loads += c.loads.Load()
+	s.LoadNotFound += c.loadNotFound.Load()
 	s.LoadErrors += c.loadErrors.Load()
 	s.Batches += c.batches.Load()
 	s.Coalesced += c.coalesced.Load()
+}
+
+// countLoad records one completed load.
+func (c *counters) countLoad(o loadOutcome) {
+	c.loads.Add(1)
+	switch o {
+	case loadNotFound:
+		c.loadNotFound.Add(1)
+	case loadFailed:
+		c.loadErrors.Add(1)
+	}
 }
 
 type counters struct {
@@ -70,6 +86,7 @@ type counters struct {
 	replacements atomic.Int64
 	rejections   atomic.Int64
 	loads        atomic.Int64
+	loadNotFound atomic.Int64
 	loadErrors   atomic.Int64
 	batches      atomic.Int64
 	coalesced    atomic.Int64
