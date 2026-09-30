@@ -141,9 +141,9 @@ func TestGetManyOrLoadRemembersAbsentKeys(t *testing.T) {
 	if n := len(r.calls()); n != 1 {
 		t.Fatalf("loader ran %d times; want 1", n)
 	}
-	if st := c.Stats(); st.Loads != 2 || st.LoadErrors != 1 {
-		t.Fatalf("loads/errors = %d/%d; want 2/1, a missing key counts as a failed load as it does for Loader",
-			st.Loads, st.LoadErrors)
+	if st := c.Stats(); st.Loads != 2 || st.LoadNotFound != 1 || st.LoadErrors != 0 {
+		t.Fatalf("loads/notFound/errors = %d/%d/%d; want 2/1/0, a missing key is an answer, as ErrNotFound from Loader is",
+			st.Loads, st.LoadNotFound, st.LoadErrors)
 	}
 }
 

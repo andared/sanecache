@@ -53,12 +53,7 @@ func (v *View[T]) loadUncached(ctx context.Context, key string) (T, error) {
 
 	go g.run(key, cl, func() (T, error) {
 		return v.loader(loadCtx, key)
-	}, func(failed bool) {
-		v.count(&v.stats.loads)
-		if failed {
-			v.count(&v.stats.loadErrors)
-		}
-	})
+	}, v.countLoad)
 
 	return g.wait(ctx, key, cl)
 }
@@ -115,12 +110,10 @@ func (v *View[T]) load(ctx context.Context, key string) (T, error) {
 			}
 
 			return value, err
-		}, func(failed bool) {
-			v.count(&v.stats.loads)
-			v.count(&s.counters.loads)
-			if failed {
-				v.count(&v.stats.loadErrors)
-				v.count(&s.counters.loadErrors)
+		}, func(o loadOutcome) {
+			v.countLoad(o)
+			if v.countStats {
+				s.counters.countLoad(o)
 			}
 		})
 	}()

@@ -142,18 +142,15 @@ func (c *core[K, V]) run(ctx context.Context, g *flightGroup[K, V], s *shard[K, 
 		}
 
 		return v, err
-	}, func(failed bool) {
+	}, func(o loadOutcome) {
 		if c.countStats {
-			s.counters.loads.Add(1)
-			if failed {
-				s.counters.loadErrors.Add(1)
-			}
+			s.counters.countLoad(o)
 		}
 	})
 }
 
 // run shares result publication and panic handling between cache and view loads.
-func (g *flightGroup[K, V]) run(key K, cl *call[V], load func() (V, error), record func(bool)) {
+func (g *flightGroup[K, V]) run(key K, cl *call[V], load func() (V, error), record func(loadOutcome)) {
 	defer cl.cancel()
 
 	// The loader does not run on a caller's goroutine, so a panic in it would
@@ -166,7 +163,7 @@ func (g *flightGroup[K, V]) run(key K, cl *call[V], load func() (V, error), reco
 		if r := recover(); r != nil {
 			cl.pan = &loaderPanic{value: r, stack: debug.Stack()}
 		}
-		record(cl.err != nil || cl.pan != nil)
+		record(outcomeOf(cl.err, cl.pan))
 		g.finish(key, cl)
 	}()
 
@@ -219,6 +216,31 @@ func (g *flightGroup[K, V]) finish(key K, cl *call[V]) {
 	g.mu.Unlock()
 
 	close(cl.done)
+}
+
+// loadOutcome is how a completed load ended, as the counters see it.
+type loadOutcome uint8
+
+const (
+	loadOK loadOutcome = iota
+	// loadNotFound is the upstream saying the key does not exist. It is kept
+	// apart from failures: a service asking for ids that are gone is working as
+	// designed, and counting it as an error hides the errors that are real.
+	loadNotFound
+	loadFailed
+)
+
+func outcomeOf(err error, pan *loaderPanic) loadOutcome {
+	switch {
+	case pan != nil:
+		return loadFailed
+	case err == nil:
+		return loadOK
+	case errors.Is(err, ErrNotFound):
+		return loadNotFound
+	default:
+		return loadFailed
+	}
 }
 
 // loaderPanic carries a panic from the loader's goroutine to the callers waiting

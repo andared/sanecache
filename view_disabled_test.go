@@ -81,6 +81,9 @@ func TestDisabledViewDoesNotRememberNotFound(t *testing.T) {
 	if calls != 2 {
 		t.Fatalf("loads = %d; want 2", calls)
 	}
+	if st := v.Stats(); st.Loads != 2 || st.LoadNotFound != 2 || st.LoadErrors != 0 {
+		t.Fatalf("Stats = %+v; want both loads counted as not found, not as failures", st)
+	}
 }
 
 func TestDisabledViewRefusesWrites(t *testing.T) {

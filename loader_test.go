@@ -169,8 +169,9 @@ func TestGetOrLoadCachesNotFound(t *testing.T) {
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("loader ran %d times; want 1, the second answer was cached", got)
 	}
-	if st := c.Stats(); st.Negatives != 1 || st.LoadErrors != 1 {
-		t.Fatalf("negatives/loadErrors = %d/%d; want 1/1", st.Negatives, st.LoadErrors)
+	if st := c.Stats(); st.Negatives != 1 || st.LoadNotFound != 1 || st.LoadErrors != 0 {
+		t.Fatalf("negatives/loadNotFound/loadErrors = %d/%d/%d; want 1/1/0, not found is not a failure",
+			st.Negatives, st.LoadNotFound, st.LoadErrors)
 	}
 }
 
