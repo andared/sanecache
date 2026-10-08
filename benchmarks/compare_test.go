@@ -19,11 +19,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Yiling-J/theine-go"
 	"github.com/andared/sanecache"
 	"github.com/dgraph-io/ristretto/v2"
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/maypok86/otter/v2"
+	"github.com/viccon/sturdyc"
 )
 
 const (
@@ -61,9 +63,11 @@ func factories() []factory {
 			return openSane(16, time.Millisecond, sanecache.ClearOnFull)
 		}},
 		{"otter", openOtter},
+		{"theine", openTheine},
 		{"ristretto", openRistretto},
 		{"golang-lru-expirable", openExpirable},
 		{"ttlcache", openTTLCache},
+		{"sturdyc", openSturdyc},
 	}
 }
 
@@ -107,6 +111,28 @@ func (o otterCache) set(key string, v []byte) { o.c.Set(key, v) }
 func (o otterCache) wait() {}
 
 func (o otterCache) close() {}
+
+type theineCache struct{ c *theine.Cache[string, []byte] }
+
+func openTheine() cache {
+	c, err := theine.NewBuilder[string, []byte](capacity * valueSize).
+		Cost(func(v []byte) int64 { return int64(len(v)) }).
+		Build()
+	if err != nil {
+		panic(err)
+	}
+
+	return theineCache{c}
+}
+
+func (t theineCache) get(key string) bool { _, ok := t.c.Get(key); return ok }
+
+// Cost 0 asks theine to call the Cost function given to the builder.
+func (t theineCache) set(key string, v []byte) { t.c.SetWithTTL(key, v, 0, benchTTL) }
+
+func (t theineCache) wait() {}
+
+func (t theineCache) close() { t.c.Close() }
 
 type ristrettoCache struct {
 	c *ristretto.Cache[string, []byte]
@@ -179,6 +205,26 @@ func (t ttlCache) set(key string, v []byte) { t.c.Set(key, v, ttlcache.DefaultTT
 func (t ttlCache) wait() {}
 
 func (t ttlCache) close() { t.c.Stop() }
+
+type sturdycCache struct{ c *sturdyc.Client[[]byte] }
+
+func openSturdyc() cache {
+	// Entry count rather than bytes: this cache has no notion of cost. Shards
+	// and the share evicted when full are the values from its own README.
+	// Its expiry sweeper never exits and keeps the client alive, so every run
+	// would leak a full cache into the ones after it; nothing expires mid-run,
+	// so turning it off changes nothing else.
+	return sturdycCache{sturdyc.New[[]byte](capacity, 10, benchTTL, 10,
+		sturdyc.WithNoContinuousEvictions())}
+}
+
+func (s sturdycCache) get(key string) bool { _, ok := s.c.Get(key); return ok }
+
+func (s sturdycCache) set(key string, v []byte) { s.c.Set(key, v) }
+
+func (s sturdycCache) wait() {}
+
+func (s sturdycCache) close() {}
 
 // keySet precomputes keys so that the benchmarks measure the cache rather than
 // strconv.
