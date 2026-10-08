@@ -551,14 +551,44 @@ points of hit rate. It is a trade for caches whose access order is flat, not a f
 sturdyc makes a milder version of the same trade: when a shard is full it drops the
 least recently used tenth of it at once, which costs it 4 points against a plain LRU.
 
+### The features are not the difference either
+
+Loading a cold key once, loading many keys in one call and a budget in something other
+than entries are not unique to this library. As of otter v2.3.0,
+[theine](https://github.com/Yiling-J/theine-go) v0.6.2,
+[sturdyc](https://github.com/viccon/sturdyc) v1.1.6 and ttlcache v3.4.1:
+
+| | one load per key | batch load | budget by cost | "not found" remembered | value over budget |
+|---|---|---|---|---|---|
+| sanecache | `GetOrLoad` | `GetManyOrLoad` | `MaxBytes` + `Cost` | `SetNegative` | `ErrTooLarge` |
+| otter v2 | `Get` + `Loader` | `BulkGet` | `MaximumWeight` + `Weigher` | no: `ErrNotFound` deletes | accepted, then evicted |
+| theine | loading cache | — | `Cost` | — | `Set` returns `false` |
+| sturdyc | `GetOrFetch` | `GetOrFetchBatch` | — | `WithMissingRecordStorage` | — |
+| ttlcache v3 | `SuppressedLoader` | — | `WithMaxCost` | — | evicts everything, itself last |
+
+They also do things this library does not. otter and sturdyc refresh entries in the
+background before they expire, so a hot key never goes cold; otter and theine can save the
+cache to a file and load it back; sturdyc coalesces refreshes into batches and can sit in
+front of a distributed store. sturdyc can also hold several value types in one cache, with
+typed package-level functions on top, though its capacity is a count of entries rather than
+bytes.
+
+What is left is the combination rather than any single feature: a byte budget that refuses
+what does not fit, missing records charged against that budget, and value types with costs
+of their own [under one budget](#several-value-types-under-one-budget). If background
+refresh matters more to you than that, otter or sturdyc is the better fit.
+
 ## When to use something else
 
 - You want the best possible hit rate for a given memory budget, and admission policies and
   access-frequency estimation are worth the complexity → [otter](https://github.com/maypok86/otter).
   The hit-rate table above is the size of the prize, and it is the biggest number on this page.
 - Your read path is hot enough that how well a cache scales across cores is a real
-  difference → otter or [ristretto](https://github.com/dgraph-io/ristretto), and budget for
-  `Wait()` in the tests.
+  difference → otter or [ristretto](https://github.com/dgraph-io/ristretto); with ristretto,
+  budget for `Wait()` in the tests.
+- You call an upstream API and want entries refreshed before they expire, refreshes
+  coalesced into batches, or a distributed store behind the cache →
+  [sturdyc](https://github.com/viccon/sturdyc).
 - You are caching hundreds of megabytes and GC pressure from millions of live pointers is
   your actual problem → [bigcache](https://github.com/allegro/bigcache) or
   [freecache](https://github.com/coocood/freecache), which reduce GC scanning by storing entries
@@ -571,7 +601,7 @@ least recently used tenth of it at once, which costs it 4 points against a plain
 
 ## Status
 
-v0.6. The API above is what exists and is tested; expect it to move before v1.
+v0.7. The API above is what exists and is tested; expect it to move before v1.
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for what this
 library optimises for before proposing a change.
