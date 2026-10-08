@@ -493,36 +493,39 @@ calling it is still better than relying on when the collector gets around to it.
 
 The `benchmarks/` module measures this cache against the ones it would otherwise be
 replacing. It is a separate module so the root stays dependency-free; `make bench-compare`
-runs it. Same machine as above, 256-byte values, a budget sized to 4096 of them. The
-sanecache rows are its knobs, each one added to the row above it.
+runs it. Same machine as above, Go 1.24, 256-byte values, a budget sized to 4096 of them,
+medians of five runs. The sanecache rows are its knobs, each one added to the row above it.
 
 | ns/op | serial `Get` | `Get` ×8 | `Set` ×8 | 90/10 ×8 |
 |---|---:|---:|---:|---:|
-| sanecache, defaults | 61 | 139 | 226 | 151 |
-| ⤷ `Shards: 16` | 64 | 42 | 91 | 49 |
-| ⤷ + `ClockGranularity` | 34 | 32 | 84 | 42 |
-| ⤷ + `ClearOnFull` | 32 | 20 | 90 | 39 |
-| [otter](https://github.com/maypok86/otter) v2 | 77 | 14 | 263 | 30 |
-| [ristretto](https://github.com/dgraph-io/ristretto) v2 | 86 | 21 | 324 | 65 |
-| [golang-lru](https://github.com/hashicorp/golang-lru) `v2/expirable` | 52 | 142 | 190 | 165 |
-| [ttlcache](https://github.com/jellydator/ttlcache) v3 | 63 | 177 | 267 | 192 |
+| sanecache, defaults | 62 | 141 | 229 | 156 |
+| ⤷ `Shards: 16` | 64 | 42 | 90 | 49 |
+| ⤷ + `ClockGranularity` | 33 | 32 | 81 | 38 |
+| ⤷ + `ClearOnFull` | 31 | 19 | 86 | 38 |
+| [otter](https://github.com/maypok86/otter) v2 | 80 | 14 | 268 | 29 |
+| [theine](https://github.com/Yiling-J/theine-go) | 91 | 13 | 174 | 57 |
+| [ristretto](https://github.com/dgraph-io/ristretto) v2 | 87 | 21 | 252 | 70 |
+| [sturdyc](https://github.com/viccon/sturdyc) | 62 | 32 | 121 | 67 |
+| [golang-lru](https://github.com/hashicorp/golang-lru) `v2/expirable` | 54 | 140 | 185 | 168 |
+| [ttlcache](https://github.com/jellydator/ttlcache) v3 | 63 | 175 | 264 | 193 |
 
 The first column is what one lookup costs; the second is what eight goroutines get out of
 the same machine. Read them together, because they say opposite things. Per operation this
-cache is *cheaper* than otter and ristretto — they spend their time maintaining a frequency
-sketch and a set of ring buffers that only pay off later. What they buy with it is scaling:
-otter turns eight cores into 5.4x the throughput, this one into 1.6x, and unsharded into
-less than 1x, because reads take a lock and locks are where cores queue.
+cache is *cheaper* than otter, theine and ristretto — they spend their time maintaining a
+frequency sketch and a set of ring buffers that only pay off later. What they buy with it is
+scaling: otter and theine turn eight cores into 6x to 7x the throughput, this one into 1.6x,
+and unsharded into less than 1x, because reads take a lock and locks are where cores queue.
 
 So the honest shape of it is not "slower". It is: **the same work per operation, and less
 of the machine used to do it in parallel.** Whether that matters is a question about the
-read rate. At one lookup per request, the gap between 20 ns and 14 ns is six nanoseconds
+read rate. At one lookup per request, the gap between 19 ns and 13 ns is six nanoseconds
 against a request budget measured in milliseconds. It starts to matter when one request
 does thousands of lookups, or when the cache more or less is the service.
 
-Writes are the other way round: 91 ns against 190 to 324. An admission policy has to decide
-whether to accept each write and update its sketch, and that costs more than taking a lock
-does. A write-heavy cache is the case where this library is simply faster.
+Writes are the other way round: 81 to 90 ns against 121 to 268. An admission policy has to
+decide whether to accept each write and update its sketch, and that costs more than taking a
+lock does; sturdyc, closest here, has no admission policy either. A write-heavy cache is the
+case where this library is simply faster.
 
 The number that usually matters more than any of those is how much of a fixed budget each
 policy turns into hits. 4096 entries against a key space of 100,000:
@@ -530,19 +533,23 @@ policy turns into hits. 4096 entries against a key space of 100,000:
 | %hit | zipf s=1.20 | zipf s=1.01 | zipf + scan |
 |---|---:|---:|---:|
 | sanecache (LRU) | 87.3 | 65.8 | 78.0 |
-| sanecache (ClearOnFull) | 83.1 | 58.0 | 73.7 |
-| otter v2 | 88.9 | **71.4** | 80.8 |
-| ristretto v2 | 87.4 | 68.7 | 78.9 |
+| sanecache (ClearOnFull) | 83.2 | 57.9 | 73.7 |
+| otter v2 | 88.9 | **71.3** | **80.8** |
+| theine | **89.0** | **71.3** | 80.7 |
+| ristretto v2 | 87.3 | 68.7 | 79.0 |
+| sturdyc | 84.9 | 61.6 | 75.3 |
 | golang-lru `expirable` | 87.3 | 65.8 | 78.0 |
 | ttlcache v3 | 87.3 | 65.8 | 78.0 |
 
-When the hot set fits, every policy looks the same and the extra machinery buys 1.6 points.
-When it does not, W-TinyLFU is worth 5.6 points of hit rate over LRU — and 5.6 points of
+When the hot set fits, every policy looks the same and the extra machinery buys 1.7 points.
+When it does not, W-TinyLFU is worth 5.5 points of hit rate over LRU — and 5.5 points of
 upstream traffic is worth more than every nanosecond in the table above it. That is the real
-reason to pick otter, and it is a better one than throughput.
+reason to pick otter or theine, and it is a better one than throughput.
 
-The same table prices the cheap read lock: `ClearOnFull` buys its 40% by giving up 7.8
+The same table prices the cheap read lock: `ClearOnFull` buys its 40% by giving up 7.9
 points of hit rate. It is a trade for caches whose access order is flat, not a free win.
+sturdyc makes a milder version of the same trade: when a shard is full it drops the
+least recently used tenth of it at once, which costs it 4 points against a plain LRU.
 
 ## When to use something else
 
