@@ -10,6 +10,8 @@ While the major version is 0, the public API may change in any release.
 
 - The comparison benchmarks include theine and sturdyc, `make bench-compare` adds a serial
   `Get` and five runs of each, and the README tables are medians of those runs.
+- The README compares features with otter, theine, sturdyc and ttlcache, including what
+  they do that this library does not, and points to sturdyc for background refresh.
 
 ## [0.7.0] - 2026-09-30
 
