@@ -9,69 +9,45 @@ import (
 )
 
 // viewSeparator joins a view's name to the caller's key. Names may not contain
-// it, which is what makes the join unambiguous: "article:1:2" can only be key
-// "1:2" in view "article".
+// it, so "article:1:2" can only be key "1:2" in view "article".
 const viewSeparator = ":"
 
 // ViewOptions configures a view. Only Name is required.
 type ViewOptions[T any] struct {
-	// Name identifies the view and namespaces its keys: the view stores under
-	// Name + ":" + key. Two views therefore cannot collide, and an OnEvict
-	// handler on the cache can tell whose entry it is looking at. It must not be
-	// empty and must not contain ":".
+	// Name namespaces the view's keys: it stores under Name + ":" + key. It must
+	// not be empty or contain ":".
 	Name string
 
-	// Loader fetches an uncached value using the caller's key without the name
-	// prefix. It follows Options.Loader's error, cancellation and panic policy.
-	// Concurrent loads coalesce within this View instance; reuse the instance
-	// to share in-flight work. Separate views (even with the same name) and the
-	// underlying cache have independent loaders and in-flight work.
-	// A loader must not recursively load the same key through this view.
+	// Loader fetches an uncached value by the caller's key, without the prefix,
+	// under Options.Loader's rules. Loads coalesce within one View instance, not
+	// across views of the same name or with the cache's own loads. A loader must
+	// not load its own key through this view.
 	Loader func(context.Context, string) (T, error)
 
-	// Cost reports the memory a value of this view occupies, in bytes, the way
-	// Options.Cost does for the cache as a whole. A view that sets it is spared
-	// the type switch that a shared Cost func(any) int64 turns into once a
-	// budget holds several types. Unset, the cache's own Cost is used.
+	// Cost is Options.Cost for this view's values, sparing the cache's Cost a type
+	// switch. Unset, the cache's Cost is used.
 	Cost func(T) int64
 
-	// TTL is how long this view's values stay valid. Zero takes the cache's TTL;
-	// SetTTL still overrides both.
-	//
-	// A view with a much shorter TTL than the cache is worth a word of warning:
-	// the sweeper's interval is chosen from the cache's TTLs, so those entries
-	// may sit on the budget after expiring until a lookup or a sweep finds them.
-	// Set Options.CleanupInterval when that matters.
+	// TTL is how long this view's values stay valid; zero takes the cache's. The
+	// sweep interval follows the cache's TTLs, so with a much shorter TTL here,
+	// set Options.CleanupInterval.
 	TTL time.Duration
 
-	// NegativeTTL is how long this view's "does not exist" answers live. Zero
-	// takes the cache's NegativeTTL, and if that is unset too, SetNegative on
-	// this view reports ErrNegativeDisabled.
+	// NegativeTTL is how long this view's "does not exist" answers live; zero
+	// takes the cache's.
 	NegativeTTL time.Duration
 
-	// RefreshAfter is Options.RefreshAfter for this view's values, refreshed with
-	// this view's loaders: Loader for GetOrLoad, Get and Lookup, the caller's
-	// function for GetOrLoadFunc. It must be shorter than the view's TTL. Unlike
-	// TTL it is not taken from the cache when zero, since the cache's would have
-	// to fit every view's TTL; zero means this view does not refresh, and the
-	// cache's RefreshAfter never touches a view's values.
+	// RefreshAfter is Options.RefreshAfter for this view, with its own loaders.
+	// It must be shorter than the view's TTL. Zero means no refresh: the cache's
+	// RefreshAfter is not inherited and never applies to a view's values.
 	RefreshAfter time.Duration
 }
 
-// View is a typed window onto a cache that holds values of several types under
-// one byte budget. The cache is declared as Cache[string, any]; each view fixes
-// one value type, namespaces its keys, and counts its own hits.
-//
-// This is the shape that a budget in bytes forces. One cache per type would mean
-// one budget per type, and splitting a fixed amount of memory between types up
-// front is exactly the guess the byte budget was meant to avoid: the split that
-// was right at deploy time is wrong by the next traffic pattern. A view is a
-// function rather than a method on Cache because a method cannot introduce a
-// type parameter of its own.
-//
-// A view costs one string join per operation on top of the cache underneath.
-// While the name and key together fit in 32 bytes the compiler keeps that on the
-// stack; past it, every read allocates.
+// View is a typed window onto a Cache[string, any] that holds several value types
+// under one byte budget: one cache per type would mean splitting the memory
+// between types up front. Each view fixes a type, namespaces its keys and counts
+// its own hits. It costs a string join per operation, which allocates once name
+// and key exceed 32 bytes.
 type View[T any] struct {
 	cache        *Cache[string, any]
 	name         string
@@ -82,8 +58,7 @@ type View[T any] struct {
 	refreshAfter time.Duration
 	countStats   bool
 
-	// getRefresher is who Get and Lookup read as: refreshView with RefreshAfter
-	// and a Loader, refreshNone otherwise. Worked out once, as the cache does.
+	// getRefresher is refresherWith(loader), worked out once.
 	getRefresher refresher
 
 	loader  func(context.Context, string) (T, error)
@@ -93,15 +68,13 @@ type View[T any] struct {
 	stats *counters
 }
 
-// NewView opens a view named o.Name onto c. It panics on a name that cannot keep
-// views apart, for the same reason New panics on a budget it cannot honour.
+// NewView opens a view named o.Name onto c. It panics on invalid options, as New
+// does.
 //
-// A nil c opens a view with caching switched off, for the configuration where a
-// TTL of zero means "do not cache": code keeps calling GetOrLoad either way. Such
-// a view runs the loader on every call, still sharing one call among callers who
-// arrive while it runs, and remembers nothing, "does not exist" included. Its
-// lookups are misses, Delete reports false, and writes fail with ErrDisabled.
-// Its counters are its own.
+// A nil c switches caching off, so that code can keep calling GetOrLoad: the
+// loader runs on every call, still shared by concurrent callers, and nothing is
+// remembered. Lookups miss, Delete reports false, and writes fail with
+// ErrDisabled.
 func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 	switch {
 	case o.Name == "":
@@ -160,8 +133,7 @@ func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 	return v
 }
 
-// Name returns the view's name, which is also the prefix its keys carry in the
-// underlying cache.
+// Name returns the view's name, the prefix of its keys in the cache.
 func (v *View[T]) Name() string { return v.name }
 
 // Get returns the cached value. As with Cache.Get, a cached "does not exist"
@@ -172,18 +144,15 @@ func (v *View[T]) Get(key string) (T, bool) {
 	return val, st == StatusHit
 }
 
-// Lookup returns the cached value and how the view answered. An entry holding
-// some other type is reported as a miss and counted as a TypeMiss: the value is
-// unusable here, so the caller has to go to the upstream either way. With
-// RefreshAfter and a Loader, a value due for a refresh starts one.
+// Lookup returns the cached value and how the view answered. An entry of another
+// type is a miss, counted as a TypeMiss. With RefreshAfter and a Loader, a value
+// due for a refresh starts one.
 func (v *View[T]) Lookup(key string) (T, Status) {
-	// background rather than context.Background(): the call is what would keep
-	// this from inlining into Get, and that costs every view read a call.
+	// Not context.Background(): that call would keep this from inlining.
 	return v.lookup(background, key, v.getRefresher, v.loader)
 }
 
-// background is the context of the refreshes Get and Lookup start, which have no
-// caller's context to carry.
+// background is the context of refreshes that Get and Lookup start.
 var background = context.Background()
 
 // lookup is Lookup as reader by, refreshing with loader.
@@ -232,8 +201,7 @@ func (v *View[T]) Set(key string, value T) error {
 	return v.SetTTL(key, value, v.ttl)
 }
 
-// SetTTL caches value under key for ttl, overriding both the view's and the
-// cache's TTL. A ttl of zero means the entry never expires on its own.
+// SetTTL caches value under key for ttl; zero means it never expires.
 func (v *View[T]) SetTTL(key string, value T, ttl time.Duration) error {
 	if v.cache == nil {
 		return ErrDisabled
@@ -257,9 +225,8 @@ func (v *View[T]) SetNegativeTTL(key string, ttl time.Duration) error {
 	return v.cache.core.setNegative(v.prefix+key, ttl)
 }
 
-// Delete removes key from this view and reports whether it was present. It also
-// invalidates outstanding loads for the namespaced key, including those in other
-// views or the parent cache. Existing waiters still receive their loader result.
+// Delete is Cache.Delete for this view's key, invalidating its loads in any view
+// or the cache.
 func (v *View[T]) Delete(key string) bool {
 	if v.cache == nil {
 		return false
@@ -268,16 +235,14 @@ func (v *View[T]) Delete(key string) bool {
 	return v.cache.Delete(v.prefix + key)
 }
 
-// Stats returns a snapshot of the counters for this view's name. Views opened
-// with the same name on the same cache share them, as they share the keys. The
-// cache's own Stats counts the same lookups across every view.
+// Stats returns the counters of this view's name, shared by every view of that
+// name on the cache. The cache's Stats counts the same lookups too.
 func (v *View[T]) Stats() ViewStats {
 	return v.stats.viewStats()
 }
 
-// ViewStats returns a snapshot of the counters of every view opened on the
-// cache, by view name. It is what a metrics exporter polls: the cache knows its
-// views, so the application does not need a registry of its own.
+// ViewStats returns the counters of every view opened on the cache, by name, so
+// that an exporter needs no registry of its own.
 func (c *Cache[K, V]) ViewStats() map[string]ViewStats {
 	c.core.viewsMu.Lock()
 	defer c.core.viewsMu.Unlock()
@@ -290,8 +255,7 @@ func (c *Cache[K, V]) ViewStats() map[string]ViewStats {
 	return stats
 }
 
-// viewCounters returns the counters for a view name, creating them on first use.
-// A view uses only some of them.
+// viewCounters returns the counters of a view name, creating them on first use.
 func (c *core[K, V]) viewCounters(name string) *counters {
 	c.viewsMu.Lock()
 	defer c.viewsMu.Unlock()
@@ -331,17 +295,14 @@ func (v *View[T]) count(c *atomic.Int64) {
 	}
 }
 
-// ViewStats is a snapshot of the counters for one view name, cumulative since
-// the first view with that name was opened on the cache.
+// ViewStats is a snapshot of the counters of one view name.
 type ViewStats struct {
 	Hits      int64 // lookups that returned a value of this view's type
 	Misses    int64 // lookups that found nothing
 	Negatives int64 // lookups that found a cached "does not exist"
 
-	// TypeMisses counts lookups that found an entry holding another type. It is
-	// a bug detector rather than a routine metric: with keys namespaced by view
-	// name, the only ways to get one are two views sharing a name and writes
-	// made straight to the underlying cache.
+	// TypeMisses counts lookups that found another type: a bug detector, since
+	// only two views of one name or writes straight to the cache cause them.
 	TypeMisses int64
 
 	Loads        int64 // completed loader calls, including errors and panics

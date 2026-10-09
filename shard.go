@@ -5,30 +5,28 @@ import (
 	"sync/atomic"
 )
 
-// entry is a single cached item. Entries are linked into an intrusive LRU list
-// so that eviction needs no allocation and no side table.
+// entry is a cached item, linked into an intrusive LRU list so that eviction
+// needs no allocation.
 type entry[K comparable, V any] struct {
 	key       K
 	value     V
 	cost      int64
 	expiresAt int64 // unix nanoseconds; 0 means "never expires"
 
-	// refreshAt is when a read able to load should start reloading the entry in
-	// the background, in unix nanoseconds; 0 means never. It is atomic because
-	// the read that claims the refresh may hold only the read lock, and claiming
-	// is a swap to 0: one refresh per stored value, however many reads see it due.
+	// refreshAt is when a read should start reloading the entry, in unix
+	// nanoseconds; 0 means never. A read claims the refresh by swapping it to 0,
+	// under what may be only the read lock, hence atomic.
 	refreshAt atomic.Int64
 
 	negative bool // upstream said this key does not exist
-	// byView marks an entry a View wrote. Only a view refreshes it, with its own
-	// loader: the cache's loader would be handed the view's prefixed key.
+	// byView marks an entry a View wrote, which only a view may refresh: the
+	// cache's loader would be handed the prefixed key.
 	byView bool
 
 	prev, next *entry[K, V] // head of the list is the most recently used entry
 }
 
-// refresher says which reader may claim an entry's refresh: nobody, the cache
-// itself, or a view. It is also what a write records as the entry's owner.
+// refresher is who reads an entry, for claiming its refresh, and who wrote it.
 type refresher uint8
 
 const (
@@ -37,10 +35,9 @@ const (
 	refreshView
 )
 
-// claimRefresh reports whether this read, by a reader that can refresh, is the
-// one to refresh e. The caller holds the shard lock, read or write, and checks
-// for refreshNone itself: reads that cannot refresh are most reads, and they
-// should not pay for a call.
+// claimRefresh reports whether a read by by is the one to refresh e. The caller
+// holds the shard lock and has ruled out refreshNone, so that most reads skip
+// the call.
 func (e *entry[K, V]) claimRefresh(by refresher, now int64) bool {
 	if e.byView != (by == refreshView) {
 		return false
@@ -54,9 +51,7 @@ func (e *entry[K, V]) expired(now int64) bool {
 	return e.expiresAt != 0 && now >= e.expiresAt
 }
 
-// shard is an independently locked slice of the cache. A cache with one shard
-// is a plain map behind a single lock; more shards trade exact budget accounting
-// for less lock contention.
+// shard is an independently locked slice of the cache.
 type shard[K comparable, V any] struct {
 	mu    sync.RWMutex
 	items map[K]*entry[K, V]
@@ -71,23 +66,16 @@ type shard[K comparable, V any] struct {
 	maxEntries int
 	policy     Policy
 
-	// Counters live on the shard rather than on the cache because one counter is
-	// one cache line, and every core in the process writes to it on every
-	// lookup: that single line held reads to a fifth of their throughput however
-	// many shards they were spread across. The lock was never the limit.
-	//
-	// The padding matters as much as the split does. Sharing a line with the
-	// fields above, which every read reads, a counter write invalidates that
-	// line for every other core — and a read lock then costs more than the
-	// exclusive one it was there to avoid. Measured on a single shard under
-	// ClearOnFull: 161 ns padded down to 109.
+	// Counters per shard, padded off the fields every read reads: one shared
+	// counter line held reads to a fifth of their throughput however many shards
+	// they used, and without padding a read lock cost more than the write lock it
+	// avoids (padding took one ClearOnFull shard from 161 ns to 109).
 	_        [cacheLine]byte
 	counters counters
 	_        [cacheLine]byte
 }
 
-// cacheLine is 64 bytes on every architecture this is likely to run on, and
-// being wrong about it costs padding rather than correctness.
+// cacheLine is 64 bytes almost everywhere; being wrong costs only padding.
 const cacheLine = 64
 
 func newShard[K comparable, V any](maxBytes int64, maxEntries int, policy Policy) *shard[K, V] {
@@ -99,16 +87,13 @@ func newShard[K comparable, V any](maxBytes int64, maxEntries int, policy Policy
 	}
 }
 
-// get returns the entry's value along with its status. expired reports that the
-// lookup landed on an entry that had already expired, so the caller can account
-// for it separately from a plain miss. refresh reports that the hit was due for a
-// refresh and that this reader, being the kind given by by, claimed it.
+// get returns the entry's value and status. expired reports a miss on an entry
+// that had expired; refresh, that the hit was due and the read by by claimed it.
 func (s *shard[K, V]) get(key K, now int64, by refresher) (_ V, _ Status, expired, refresh bool) {
 	var zero V
 
-	// Under ClearOnFull nothing is reordered on access, so reads take only the
-	// read lock. That is the whole point of the policy: keeping LRU order costs
-	// a write lock on every read.
+	// ClearOnFull reorders nothing on access, so reads take only the read lock:
+	// that is the point of the policy.
 	if s.policy == ClearOnFull {
 		s.mu.RLock()
 		e, ok := s.items[key]
@@ -119,10 +104,8 @@ func (s *shard[K, V]) get(key K, now int64, by refresher) (_ V, _ Status, expire
 		if e.expired(now) {
 			s.mu.RUnlock()
 
-			// Drop it under the write lock rather than leaving it for the
-			// sweeper: an expired entry that stays in the map would be counted
-			// as an expiration again on every lookup, and would go on holding
-			// budget in the meantime. Only the goroutine that removes it counts it.
+			// Dropped now, or every lookup until the sweep would count it as an
+			// expiration again. Only the goroutine that removes it counts it.
 			s.mu.Lock()
 			cur, still := s.items[key]
 			removed := still && cur == e
@@ -170,9 +153,8 @@ func (s *shard[K, V]) get(key K, now int64, by refresher) (_ V, _ Status, expire
 	return e.value, StatusHit, false, refresh
 }
 
-// set stores e, returning the entry it replaced (if any) and the entries evicted
-// to stay inside the budget. A value that cannot fit on its own is rejected with
-// ErrTooLarge rather than stored and silently dropped later.
+// set stores e, returning the entry it replaced and those evicted to make room.
+// A value that cannot fit on its own is refused with ErrTooLarge.
 func (s *shard[K, V]) set(e *entry[K, V], tokens ...*loadToken) (replaced *entry[K, V], victims []*entry[K, V], err error) {
 	if s.maxBytes > 0 && e.cost > s.maxBytes {
 		return nil, nil, ErrTooLarge
@@ -246,9 +228,8 @@ func (s *shard[K, V]) stats() (entries int, bytes int64) {
 	return len(s.items), s.bytes
 }
 
-// evict brings the shard back inside its budget. keep is the entry that was just
-// stored: ClearOnFull wipes everything else rather than picking victims, but
-// dropping the write that triggered the wipe would only force an immediate refetch.
+// evict brings the shard back inside its budget, never evicting keep, the entry
+// just stored: ClearOnFull wipes everything else.
 func (s *shard[K, V]) evict(keep *entry[K, V]) []*entry[K, V] {
 	if !s.over() {
 		return nil
@@ -324,8 +305,8 @@ func (s *shard[K, V]) unlink(e *entry[K, V]) {
 	e.prev, e.next = nil, nil
 }
 
-// loadToken connects a flight to mutations of its storage key, including writes
-// through other views. Validity is checked under the storage lock when publishing.
+// loadToken lets a write or delete of a storage key, through any view, stop the
+// key's loads from publishing; it is checked under the shard lock.
 type loadToken struct{ valid atomic.Bool }
 
 func (s *shard[K, V]) beginLoad(key K) *loadToken {

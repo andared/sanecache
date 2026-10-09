@@ -9,14 +9,12 @@ While the major version is 0, the public API may change in any release.
 ### Added
 
 - `Options.RefreshAfter` and `ViewOptions.RefreshAfter`: a value read after it is this old
-  is returned at once and reloaded in the background, so a key in steady use is replaced
-  before it expires instead of making the next caller wait for the upstream. `GetOrLoad`,
-  `GetManyOrLoad` and `GetOrLoadFunc` refresh with their loaders, `Get` and `Lookup` with
-  the loaders in the options. Each value gets one refresh; a failed one leaves it in place
-  until its TTL, and the TTL is never extended. `GetManyOrLoad` refreshes the keys it finds
-  due in one `BatchLoader` call. Off by default; it must be shorter than the TTL.
-- `Stats.Refreshes`, `Stats.RefreshErrors` and the same in `ViewStats`. Refreshes are not
-  counted in `Loads`.
+  is returned at once and reloaded in the background, so a key in steady use does not go
+  cold. Any read with a loader refreshes, `Get` and `Lookup` included; `GetManyOrLoad`
+  refreshes its due keys in one `BatchLoader` call. One refresh per value; a failed one
+  leaves the value to its TTL, which is never extended. Off by default; it must be shorter
+  than the TTL.
+- `Stats.Refreshes` and `Stats.RefreshErrors`, also in `ViewStats`, apart from `Loads`.
 
 ### Changed
 

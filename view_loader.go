@@ -5,13 +5,9 @@ import (
 	"errors"
 )
 
-// GetOrLoad returns a typed cached value or calls ViewOptions.Loader. It follows
-// Cache.GetOrLoad's error and cancellation policy, storing results with this
-// view's Cost, TTL and NegativeTTL under the shared cache's budget. A wrong-type
-// entry is a miss and can be replaced by the loaded value.
-//
-// Without a view loader it returns ErrNoLoader, even for a cached key; the
-// underlying cache's loader is never used. Loads coalesce per View instance.
+// GetOrLoad is Cache.GetOrLoad with ViewOptions.Loader, storing with this view's
+// Cost and TTLs; an entry of another type is a miss the load replaces. Without
+// a view loader it returns ErrNoLoader, even for a cached key.
 func (v *View[T]) GetOrLoad(ctx context.Context, key string) (T, error) {
 	if v.loader == nil {
 		var zero T
@@ -26,15 +22,8 @@ func (v *View[T]) GetOrLoad(ctx context.Context, key string) (T, error) {
 	return v.loadWith(ctx, key, v.loader)
 }
 
-// GetOrLoadFunc is GetOrLoad with the loader passed by the caller instead of
-// taken from ViewOptions, as Cache.GetOrLoadFunc is for the cache. Results are
-// stored with this view's Cost and TTLs. Loads are shared with this View
-// instance's GetOrLoad, so load must produce what the view's loader, or any
-// other caller's function, would for that key.
-//
-// ViewOptions.Loader is not needed. A nil load returns ErrNoLoader. On a view
-// with caching switched off, load runs on every call that does not find one
-// already running.
+// GetOrLoadFunc is Cache.GetOrLoadFunc for this view, sharing loads with its
+// GetOrLoad. A nil load returns ErrNoLoader.
 func (v *View[T]) GetOrLoadFunc(ctx context.Context, key string, load func(context.Context) (T, error)) (T, error) {
 	if load == nil {
 		var zero T
@@ -64,8 +53,7 @@ func (v *View[T]) loadWith(ctx context.Context, key string, loader func(context.
 	return v.load(ctx, key, loader)
 }
 
-// loadUncached is load for a view without a cache: callers still share one call
-// while it runs, but its result, "does not exist" included, is not kept.
+// loadUncached is load for a view without a cache: shared, but not kept.
 func (v *View[T]) loadUncached(ctx context.Context, key string, loader func(context.Context, string) (T, error)) (T, error) {
 	g := v.flights[0]
 
@@ -103,8 +91,7 @@ func (v *View[T]) load(ctx context.Context, key string, loader func(context.Cont
 		return g.wait(ctx, key, cl)
 	}
 	token := s.beginLoad(fullKey)
-	// Recheck without counting another lookup: a load may have published since
-	// the caller's miss. A value of a different type still needs a typed load.
+	// load's recheck; a value of another type still needs loading.
 	raw, st, _, _ := s.get(fullKey, c.now(), refreshNone)
 	val, typed := raw.(T)
 	if st == StatusNegative || (st == StatusHit && typed) {
@@ -144,8 +131,7 @@ func (v *View[T]) refresh(ctx context.Context, key string, loader func(context.C
 	})
 }
 
-// run is Cache's run for a view's key: the result is stored under the prefixed
-// key, with the view's cost and lifetimes, and counted for the view too.
+// run is Cache's run for a view's key, counted for the view too.
 func (v *View[T]) run(
 	ctx context.Context, g *flightGroup[string, T], s *shard[string, any], key string, cl *call[T],
 	loader func(context.Context, string) (T, error), refresh bool,

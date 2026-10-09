@@ -9,43 +9,28 @@ import (
 )
 
 // GetManyOrLoad returns the cached values of keys, loading the rest in one
-// Options.BatchLoader call. It is GetOrLoad for callers that would otherwise
-// fetch keys one at a time from an upstream that answers many at once, such as
-// a database query with IN or a pipelined round trip.
+// Options.BatchLoader call, for an upstream that answers many keys at once.
 //
-// Each missing key takes part in single flight on its own: a key that some other
-// GetOrLoad or GetManyOrLoad is already loading is waited for rather than loaded
-// again, and a GetOrLoad arriving while the batch runs waits for the batch.
-// Invalidation works per key, exactly as for GetOrLoad: a Delete or a successful
-// write of one key keeps the batch's result for that key out of the cache and
-// leaves the others alone.
+// Single flight and invalidation work per key, as in GetOrLoad: a key already
+// loading elsewhere is waited for, and a GetOrLoad of a key in the batch waits
+// for the batch. A key that does not exist upstream is absent from the result
+// and is not an error. Duplicate keys are looked up once.
 //
-// The result holds every key that has a value. A key the upstream does not have
-// is absent from it, whether that answer came from the loader or from a cached
-// negative entry; it is not an error. Duplicate keys are looked up once.
-//
-// The error is the first failure among the keys, in the order they were given,
-// and the keys that failed are absent from the result; the others are still
-// there. Failures are not cached. If ctx ends first, the result holds what was
-// already at hand and the error is ctx.Err(); the loads carry on for any other
-// caller waiting for them. A loader panic reaches this caller as it would
-// through GetOrLoad.
+// The error is the first failure in key order; the keys that failed are absent
+// and the others present. If ctx ends first, the result holds what was at hand
+// and the error is ctx.Err(), while the loads carry on for other waiters.
 //
 // Without a BatchLoader the missing keys are loaded concurrently with
-// Options.Loader, one call per key. With neither, it returns ErrNoLoader.
-//
-// With RefreshAfter, the hits due for a refresh are refreshed together in one
-// BatchLoader call of their own, apart from the missing keys: nobody waits for
-// them, so they should not hold up the batch somebody does wait for.
+// Options.Loader; with neither, it returns ErrNoLoader. Keys due for a refresh
+// are refreshed in a BatchLoader call of their own, not holding up this one.
 func (c *Cache[K, V]) GetManyOrLoad(ctx context.Context, keys []K) (map[K]V, error) {
 	cr := c.core
 	if cr.loader == nil {
 		return nil, ErrNoLoader
 	}
 
-	// A warm batch is all hits, and found alone is enough to skip their
-	// duplicates; the set of keys that were not hits is only built once there is
-	// one, so that the common case costs one map rather than two.
+	// notHit is only built once there is a key that was not a hit, so that a
+	// warm batch costs one map rather than two.
 	found := make(map[K]V, len(keys))
 	var missing, due []K
 	var notHit map[K]struct{}
@@ -98,9 +83,8 @@ func (c *Cache[K, V]) GetManyOrLoad(ctx context.Context, keys []K) (map[K]V, err
 	return found, cr.collect(ctx, waits, found)
 }
 
-// flight is one key's share in a load: the call its waiters are parked on and
-// where that call lives. ctx is the load's context, set only on the flights the
-// caller starts itself.
+// flight is one key's share in a load. ctx is set only on flights the caller
+// starts itself.
 type flight[K comparable, V any] struct {
 	key K
 	g   *flightGroup[K, V]
@@ -109,18 +93,15 @@ type flight[K comparable, V any] struct {
 	ctx context.Context
 }
 
-// batchLoad is the context shared by every key of one batch. It is cancelled
-// once every key in it has lost its last waiter: until then somebody still wants
-// part of the answer, and the upstream call is the same call whichever part
-// that is.
+// batchLoad is the context of one batch, cancelled once every key in it has
+// lost its last waiter.
 type batchLoad struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	live   atomic.Int64
 }
 
-// join adds a key to the batch and returns the cancel function for that key's
-// call, which leave invokes when the key's last waiter goes.
+// join adds a key to the batch and returns the cancel function of its call.
 func (b *batchLoad) join() context.CancelFunc {
 	b.live.Add(1)
 
@@ -131,15 +112,10 @@ func (b *batchLoad) join() context.CancelFunc {
 	})
 }
 
-// acquire joins or registers a load for each key. Keys whose load published
-// between the caller's lookup and here are served from the cache instead, into
-// found. It returns every flight to wait for and, among them, the ones this
-// caller has to start, along with their batch when there is a batch loader.
-//
-// A call's cancel is in place before the call is visible to anyone else, as in
-// load: a caller that joins and then gives up may be the one to invoke it. It
-// cannot bring a fresh call's waiters to zero on its own, though, since this
-// caller is one of them until collect.
+// acquire joins or registers a load for each key, serving from the cache into
+// found the keys whose load published since the caller's lookup. It returns the
+// flights to wait for, those of them to start, and their batch, if any. A
+// call's cancel is set before anyone else can see the call.
 func (c *core[K, V]) acquire(ctx context.Context, keys []K, found map[K]V) (waits, fresh []flight[K, V], batch *batchLoad) {
 	for _, key := range keys {
 		idx := c.shardIndex(key)
@@ -155,8 +131,7 @@ func (c *core[K, V]) acquire(ctx context.Context, keys []K, found map[K]V) (wait
 			continue
 		}
 
-		// The same recheck as load's, for the same reason: without it a caller
-		// descheduled after its lookup would load a value already cached.
+		// The same recheck as load's.
 		token := s.beginLoad(key)
 		if v, st, _, _ := s.get(key, c.now(), refreshNone); st != StatusMiss {
 			s.endLoad(key, token)
@@ -169,8 +144,7 @@ func (c *core[K, V]) acquire(ctx context.Context, keys []K, found map[K]V) (wait
 			continue
 		}
 
-		// The loads outlive this caller, so they do not inherit its
-		// cancellation: values yes, deadline no. See call.waiters.
+		// Values, but not cancellation, as in startAndUnlock.
 		cl := &call[V]{done: make(chan struct{}), waiters: 1, token: token}
 		var loadCtx context.Context
 		if c.batchLoader != nil {
@@ -233,8 +207,7 @@ func (c *core[K, V]) refreshMany(ctx context.Context, keys []K) {
 	go c.runBatch(batch.ctx, batch.cancel, fresh, true)
 }
 
-// runBatch performs one batch load and publishes each key's result, the way run
-// does for one key. refresh says the batch is a refresh.
+// runBatch is run for a batch.
 func (c *core[K, V]) runBatch(ctx context.Context, cancel context.CancelFunc, fresh []flight[K, V], refresh bool) {
 	defer cancel()
 	defer func() {
@@ -243,9 +216,7 @@ func (c *core[K, V]) runBatch(ctx context.Context, cancel context.CancelFunc, fr
 		}
 	}()
 
-	// Recovered and counted on the way out for the same reasons as run: the
-	// batch does not run on any caller's goroutine, and a load that panicked is
-	// still a load that failed.
+	// Panics are carried and counted as in flightGroup.run.
 	defer func() {
 		if r := recover(); r != nil {
 			pan := &loaderPanic{value: r, stack: debug.Stack()}
@@ -274,9 +245,8 @@ func (c *core[K, V]) runBatch(ctx context.Context, cancel context.CancelFunc, fr
 		v, ok := values[f.key]
 		switch {
 		case err != nil:
-			// A failed batch fails every key in it, including any the loader
-			// managed to fill in: part of an answer from a call that reported an
-			// error is not something to cache.
+			// Every key fails, even those the map holds: part of an answer
+			// from a failed call is not worth caching.
 			f.cl.err = err
 			if errors.Is(err, ErrNotFound) {
 				_ = c.setNegative(f.key, c.negativeTTL, f.cl.token)
@@ -291,9 +261,8 @@ func (c *core[K, V]) runBatch(ctx context.Context, cancel context.CancelFunc, fr
 	}
 }
 
-// collect waits for every flight and gathers the results into found. If ctx
-// ends first, the flights not yet collected are left, so that a load nobody
-// waits for any more can be cancelled.
+// collect waits for every flight, gathering results into found. If ctx ends
+// first it leaves the rest, so that loads nobody waits for can be cancelled.
 func (c *core[K, V]) collect(ctx context.Context, waits []flight[K, V], found map[K]V) error {
 	var firstErr error
 	for i, f := range waits {
@@ -326,8 +295,7 @@ func (c *core[K, V]) collect(ctx context.Context, waits []flight[K, V], found ma
 	return firstErr
 }
 
-// loadAsBatch is the loader GetOrLoad uses when only a BatchLoader was given: a
-// batch of one, so that a cache needs a single loader for both paths.
+// loadAsBatch is GetOrLoad's loader when there is only a BatchLoader.
 func (c *core[K, V]) loadAsBatch(ctx context.Context, key K) (V, error) {
 	if c.countStats {
 		c.shardFor(key).counters.batches.Add(1)

@@ -2,8 +2,7 @@ package sanecache
 
 import "sync/atomic"
 
-// Stats is a snapshot of the cache counters. Counters are cumulative since the
-// cache was created; Entries and Bytes are instantaneous.
+// Stats is a snapshot of the cache counters, cumulative except Entries and Bytes.
 type Stats struct {
 	Hits         int64 // lookups that returned a value
 	Misses       int64 // lookups that found nothing
@@ -13,41 +12,28 @@ type Stats struct {
 	Replacements int64 // entries overwritten by a later Set
 	Rejections   int64 // Set calls refused with ErrTooLarge
 
-	// TypeMisses counts view lookups that found an entry holding some other
-	// type. Hits counts those too, because the cache did have the key; the pair
-	// is what tells a namespace collision apart from a plain miss.
+	// TypeMisses counts view lookups that found another type. Hits counts them
+	// too, since the cache had the key.
 	TypeMisses int64
 
 	Loads int64 // keys loaded by Loader or BatchLoader, successfully or not
-	// LoadNotFound counts the loads that ended in ErrNotFound, a key missing
-	// from a batch answer included. It is an answer rather than a failure, so
-	// LoadErrors does not count it.
+	// LoadNotFound counts loads that ended in ErrNotFound, keys missing from a
+	// batch answer included; LoadErrors does not.
 	LoadNotFound int64
 	LoadErrors   int64 // loads that failed: any other error, or a panic
-	// Batches counts BatchLoader calls. Against Loads it says how many keys an
-	// upstream call carries on average.
-	Batches int64
-	// Coalesced counts the GetOrLoad calls that another caller's load spared
-	// from starting one of their own, whether they waited for it or arrived just
-	// after it published. Against Loads it says how much the single flight is
-	// actually saving.
-	Coalesced int64
-	// Refreshes counts the reloads RefreshAfter started that finished, however
-	// they ended, a key at a time as Loads does. They are not in Loads: Loads is
-	// what misses cost the upstream, and Refreshes is what keeping hot keys warm
-	// costs it instead.
+	Batches      int64 // BatchLoader calls; Loads/Batches is keys per call
+	Coalesced    int64 // GetOrLoad calls spared a load by another caller's
+	// Refreshes counts finished refreshes, by key. Loads does not include them:
+	// it is what misses cost.
 	Refreshes int64
-	// RefreshErrors counts the refreshes that failed or panicked. The value they
-	// meant to replace stays until its TTL runs out. A refresh that ended in
-	// ErrNotFound is not one of them.
+	// RefreshErrors counts refreshes that failed or panicked, not ErrNotFound.
 	RefreshErrors int64
 
 	Entries int   // entries currently held, expired-but-not-yet-swept included
 	Bytes   int64 // sum of the costs of those entries
 }
 
-// HitRate reports hits as a fraction of all lookups. A cached negative answer
-// counts as a hit: it saved the same upstream call a positive one would have.
+// HitRate reports hits, cached negatives included, as a fraction of lookups.
 func (s Stats) HitRate() float64 {
 	total := s.Hits + s.Misses + s.Negatives
 	if total == 0 {
