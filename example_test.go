@@ -164,8 +164,6 @@ func ExampleCache_GetOrLoad() {
 	// upstream calls: 2
 }
 
-// Fetching many keys from an upstream that answers many at once: one call for
-// whatever the cache does not already hold.
 // A search page is cached under a key that only summarises the query. The request
 // itself travels with the call instead of being parsed back out of the key.
 func ExampleCache_GetOrLoadFunc() {
@@ -203,6 +201,8 @@ func ExampleCache_GetOrLoadFunc() {
 	// upstream calls: 1
 }
 
+// Fetching many keys from an upstream that answers many at once: one call for
+// whatever the cache does not already hold.
 func ExampleCache_GetManyOrLoad() {
 	var upstreamCalls atomic.Int64
 
