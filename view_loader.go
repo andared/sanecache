@@ -15,11 +15,7 @@ func (v *View[T]) GetOrLoad(ctx context.Context, key string) (T, error) {
 		return zero, ErrNoLoader
 	}
 
-	if val, done, err := v.cached(ctx, key, v.loader); done {
-		return val, err
-	}
-
-	return v.loadWith(ctx, key, v.loader)
+	return v.getOrLoad(ctx, key, v.loader)
 }
 
 // GetOrLoadFunc is Cache.GetOrLoadFunc for this view, sharing loads with its
@@ -30,22 +26,34 @@ func (v *View[T]) GetOrLoadFunc(ctx context.Context, key string, load func(conte
 
 		return zero, ErrNoLoader
 	}
-	loader := func(ctx context.Context, _ string) (T, error) { return load(ctx) }
+	return v.getOrLoad(ctx, key, func(ctx context.Context, _ string) (T, int64, error) {
+		val, err := load(ctx)
+
+		return val, -1, err
+	})
+}
+
+// GetOrLoadFuncWithCost is Cache.GetOrLoadFuncWithCost for this view.
+func (v *View[T]) GetOrLoadFuncWithCost(
+	ctx context.Context, key string, load func(context.Context) (T, int64, error),
+) (T, error) {
+	if load == nil {
+		var zero T
+
+		return zero, ErrNoLoader
+	}
+
+	return v.getOrLoad(ctx, key, func(ctx context.Context, _ string) (T, int64, error) {
+		val, cost, err := load(ctx)
+
+		return val, max(cost, 0), err
+	})
+}
+
+func (v *View[T]) getOrLoad(ctx context.Context, key string, loader loadFunc[string, T]) (T, error) {
 	if val, done, err := v.cached(ctx, key, loader); done {
 		return val, err
 	}
-
-	return v.loadWith(ctx, key, loader)
-}
-
-// cached is Cache.cached for a view.
-func (v *View[T]) cached(ctx context.Context, key string, loader func(context.Context, string) (T, error)) (T, bool, error) {
-	val, st := v.lookup(ctx, key, v.refresherWith(loader), loader)
-
-	return answered(ctx, val, st)
-}
-
-func (v *View[T]) loadWith(ctx context.Context, key string, loader func(context.Context, string) (T, error)) (T, error) {
 	if v.cache == nil {
 		return v.loadUncached(ctx, key, loader)
 	}
@@ -53,8 +61,15 @@ func (v *View[T]) loadWith(ctx context.Context, key string, loader func(context.
 	return v.load(ctx, key, loader)
 }
 
+// cached is Cache.cached for a view.
+func (v *View[T]) cached(ctx context.Context, key string, loader loadFunc[string, T]) (T, bool, error) {
+	val, st := v.lookup(ctx, key, v.refresherWith(loader), loader)
+
+	return answered(ctx, val, st)
+}
+
 // loadUncached is load for a view without a cache: shared, but not kept.
-func (v *View[T]) loadUncached(ctx context.Context, key string, loader func(context.Context, string) (T, error)) (T, error) {
+func (v *View[T]) loadUncached(ctx context.Context, key string, loader loadFunc[string, T]) (T, error) {
 	g := v.flights[0]
 
 	g.mu.Lock()
@@ -66,13 +81,17 @@ func (v *View[T]) loadUncached(ctx context.Context, key string, loader func(cont
 		return g.wait(ctx, key, cl)
 	}
 	cl := g.startAndUnlock(ctx, key, nil, func(ctx context.Context, cl *call[T]) {
-		g.run(key, cl, func() (T, error) { return loader(ctx, key) }, func(o loadOutcome) { v.stats.countLoad(o, false) })
+		g.run(key, cl, func() (T, error) {
+			val, _, err := loader(ctx, key)
+
+			return val, err
+		}, func(o loadOutcome) { v.stats.countLoad(o, false) })
 	})
 
 	return g.wait(ctx, key, cl)
 }
 
-func (v *View[T]) load(ctx context.Context, key string, loader func(context.Context, string) (T, error)) (T, error) {
+func (v *View[T]) load(ctx context.Context, key string, loader loadFunc[string, T]) (T, error) {
 	c := v.cache.core
 	fullKey := v.prefix + key
 	idx := c.shardIndex(fullKey)
@@ -114,7 +133,7 @@ func (v *View[T]) load(ctx context.Context, key string, loader func(context.Cont
 }
 
 // refresh is Cache's refresh for a view's key, with the view's loader.
-func (v *View[T]) refresh(ctx context.Context, key string, loader func(context.Context, string) (T, error)) {
+func (v *View[T]) refresh(ctx context.Context, key string, loader loadFunc[string, T]) {
 	c := v.cache.core
 	fullKey := v.prefix + key
 	idx := c.shardIndex(fullKey)
@@ -134,16 +153,19 @@ func (v *View[T]) refresh(ctx context.Context, key string, loader func(context.C
 // run is Cache's run for a view's key, counted for the view too.
 func (v *View[T]) run(
 	ctx context.Context, g *flightGroup[string, T], s *shard[string, any], key string, cl *call[T],
-	loader func(context.Context, string) (T, error), refresh bool,
+	loader loadFunc[string, T], refresh bool,
 ) {
 	c := v.cache.core
 	fullKey := v.prefix + key
 	defer s.endLoad(fullKey, cl.token)
 	g.run(key, cl, func() (T, error) {
-		value, err := loader(ctx, key)
+		value, cost, err := loader(ctx, key)
+		if cost < 0 {
+			cost = v.valueCost(value)
+		}
 		switch {
 		case err == nil:
-			_ = c.setValue(fullKey, value, v.valueCost(value), v.ttl, v.refreshAfter, refreshView, cl.token)
+			_ = c.setValue(fullKey, value, cost, v.ttl, v.refreshAfter, refreshView, cl.token)
 		case errors.Is(err, ErrNotFound):
 			_ = c.setNegative(fullKey, v.negativeTTL, cl.token)
 		}

@@ -171,6 +171,9 @@ page, err := c.GetOrLoadFunc(ctx, pageKey(path, params), func(ctx context.Contex
 
 It shares loads with `GetOrLoad`: callers of a key wait for whichever load started first,
 so the function must return what any caller's would for that key. Views have it too.
+`GetOrLoadFuncWithCost` and `SetWithCost` take the value's cost along with it, for when
+the size is known only where the value is produced, such as the response it was decoded
+from.
 
 ## Invalidation while loading
 

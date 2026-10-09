@@ -61,7 +61,7 @@ type View[T any] struct {
 	// getRefresher is refresherWith(loader), worked out once.
 	getRefresher refresher
 
-	loader  func(context.Context, string) (T, error)
+	loader  loadFunc[string, T]
 	flights []*flightGroup[string, T]
 
 	// stats is shared by every view of this name on this cache.
@@ -89,7 +89,7 @@ func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 
 	if c == nil {
 		v := &View[T]{
-			loader:     o.Loader,
+			loader:     unsized(o.Loader),
 			name:       o.Name,
 			prefix:     o.Name + viewSeparator,
 			countStats: true,
@@ -102,7 +102,7 @@ func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 
 	v := &View[T]{
 		cache:       c,
-		loader:      o.Loader,
+		loader:      unsized(o.Loader),
 		name:        o.Name,
 		prefix:      o.Name + viewSeparator,
 		cost:        o.Cost,
@@ -122,7 +122,7 @@ func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 			o.RefreshAfter, v.ttl))
 	}
 	v.refreshAfter = o.RefreshAfter
-	v.getRefresher = v.refresherWith(o.Loader)
+	v.getRefresher = v.refresherWith(v.loader)
 
 	// Made with or without a view loader: GetOrLoadFunc brings its own.
 	v.flights = make([]*flightGroup[string, T], len(c.core.shards))
@@ -157,7 +157,7 @@ var background = context.Background()
 
 // lookup is Lookup as reader by, refreshing with loader.
 func (v *View[T]) lookup(
-	ctx context.Context, key string, by refresher, loader func(context.Context, string) (T, error),
+	ctx context.Context, key string, by refresher, loader loadFunc[string, T],
 ) (T, Status) {
 	var zero T
 
@@ -208,6 +208,15 @@ func (v *View[T]) SetTTL(key string, value T, ttl time.Duration) error {
 	}
 
 	return v.cache.core.setValue(v.prefix+key, value, v.valueCost(value), ttl, v.refreshAfter, refreshView)
+}
+
+// SetWithCost is Cache.SetWithCost for this view, with the view's TTL.
+func (v *View[T]) SetWithCost(key string, value T, cost int64) error {
+	if v.cache == nil {
+		return ErrDisabled
+	}
+
+	return v.cache.core.setValue(v.prefix+key, value, max(cost, 0), v.ttl, v.refreshAfter, refreshView)
 }
 
 // SetNegative records that the upstream reports no such key, for the view's
@@ -273,7 +282,7 @@ func (c *core[K, V]) viewCounters(name string) *counters {
 }
 
 // refresherWith is who a read of this view is when it would refresh with loader.
-func (v *View[T]) refresherWith(loader func(context.Context, string) (T, error)) refresher {
+func (v *View[T]) refresherWith(loader loadFunc[string, T]) refresher {
 	if v.refreshAfter > 0 && loader != nil {
 		return refreshView
 	}
