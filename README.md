@@ -276,6 +276,50 @@ concurrently, one call each. `Stats().Batches` counts `BatchLoader` calls; again
 `Loads`, which counts keys, it says how many keys an upstream call carries. Batch loading
 is not available on views yet.
 
+## Refreshing before expiry
+
+A TTL is a promise about staleness, and a cache keeps it by going back to the upstream. On
+a key in steady use it does that on the request path: the value expires, the next caller
+misses and waits, and every key the service relies on goes cold once per TTL. In a busy
+cache with a high hit rate, almost every miss can be exactly that — `Expirations` and
+`Loads` moving in step is the sign of it.
+
+`RefreshAfter` moves that load off the request path:
+
+```go
+c := sanecache.New(sanecache.Options[int, *Rule]{
+    TTL:          time.Minute,
+    RefreshAfter: 40 * time.Second,
+    Loader:       loadRule,
+})
+```
+
+A read that finds a value older than `RefreshAfter` returns it at once and starts a load
+in the background. The value in the cache is replaced when the load succeeds, and the TTL
+starts over. A key nobody reads is not refreshed: it expires as it did before, so refresh
+spends upstream calls only on keys that are still wanted.
+
+**One refresh per value.** However many reads see a value due, it gets one load. The
+refresh takes part in single flight like any load: a caller that finds the key expired
+before the refresh finishes waits for it instead of starting another, and a `Delete` or a
+successful write keeps its result out.
+
+**The TTL still holds.** A failed refresh leaves the value in place until its TTL runs out,
+and is not retried; after that the next caller loads the key and sees the error, as it
+would without refresh. An upstream that is down therefore shows up one TTL later than it
+otherwise would, and never later than that. A refresh answered with `ErrNotFound` turns the
+value into a negative entry when `NegativeTTL` is set.
+
+**Any read with a loader refreshes.** `GetOrLoad` and `GetManyOrLoad` use the loaders in
+`Options`, `GetOrLoadFunc` the function it was given, and `Get` and `Lookup` the loaders in
+`Options` when there are any. `GetManyOrLoad` sends the keys it finds due to the
+`BatchLoader` in one call of their own, apart from the keys it is waiting for. Views take a
+`RefreshAfter` of their own and refresh with their own loaders.
+
+Jitter moves the refresh along with the expiry it belongs to. `Stats().Refreshes` counts
+finished refreshes and `RefreshErrors` the failed ones; neither is part of `Loads`, which
+stays what misses cost.
+
 ## Several value types under one budget
 
 A budget in bytes is only worth having if it covers everything competing for the memory.
@@ -460,7 +504,7 @@ metrics interval and export it however you like:
 s := c.Stats()
 // s.Hits, s.Misses, s.Negatives, s.TypeMisses, s.Evictions, s.Expirations,
 // s.Replacements, s.Rejections, s.Loads, s.LoadNotFound, s.LoadErrors, s.Coalesced, s.Batches,
-// s.Entries, s.Bytes, s.HitRate()
+// s.Refreshes, s.RefreshErrors, s.Entries, s.Bytes, s.HitRate()
 ```
 
 `ViewStats()` returns the same kind of snapshot for every view opened on the cache, keyed
@@ -469,7 +513,7 @@ by view name, so an exporter needs no list of views of its own:
 ```go
 for name, vs := range c.ViewStats() {
     // vs.Hits, vs.Misses, vs.Negatives, vs.TypeMisses, vs.Loads, vs.LoadNotFound,
-    // vs.LoadErrors, vs.Coalesced, vs.HitRate()
+    // vs.LoadErrors, vs.Coalesced, vs.Refreshes, vs.RefreshErrors, vs.HitRate()
 }
 ```
 
@@ -553,30 +597,28 @@ least recently used tenth of it at once, which costs it 4 points against a plain
 
 ### The features are not the difference either
 
-Loading a cold key once, loading many keys in one call and a budget in something other
-than entries are not unique to this library. As of otter v2.3.0,
+Loading a cold key once, loading many keys in one call, refreshing ahead of expiry and a
+budget in something other than entries are not unique to this library. As of otter v2.3.0,
 [theine](https://github.com/Yiling-J/theine-go) v0.6.2,
 [sturdyc](https://github.com/viccon/sturdyc) v1.1.6 and ttlcache v3.4.1:
 
-| | one load per key | batch load | budget by cost | "not found" remembered | value over budget |
-|---|---|---|---|---|---|
-| sanecache | `GetOrLoad` | `GetManyOrLoad` | `MaxBytes` + `Cost` | `SetNegative` | `ErrTooLarge` |
-| otter v2 | `Get` + `Loader` | `BulkGet` | `MaximumWeight` + `Weigher` | no: `ErrNotFound` deletes | accepted, then evicted |
-| theine | loading cache | — | `Cost` | — | `Set` returns `false` |
-| sturdyc | `GetOrFetch` | `GetOrFetchBatch` | — | `WithMissingRecordStorage` | — |
-| ttlcache v3 | `SuppressedLoader` | — | `WithMaxCost` | — | evicts everything, itself last |
+| | one load per key | batch load | refresh ahead | budget by cost | "not found" remembered | value over budget |
+|---|---|---|---|---|---|---|
+| sanecache | `GetOrLoad` | `GetManyOrLoad` | `RefreshAfter` | `MaxBytes` + `Cost` | `SetNegative` | `ErrTooLarge` |
+| otter v2 | `Get` + `Loader` | `BulkGet` | `RefreshCalculator` | `MaximumWeight` + `Weigher` | no: `ErrNotFound` deletes | accepted, then evicted |
+| theine | loading cache | — | — | `Cost` | — | `Set` returns `false` |
+| sturdyc | `GetOrFetch` | `GetOrFetchBatch` | `WithEarlyRefreshes` | — | `WithMissingRecordStorage` | — |
+| ttlcache v3 | `SuppressedLoader` | — | — | `WithMaxCost` | — | evicts everything, itself last |
 
-They also do things this library does not. otter and sturdyc refresh entries in the
-background before they expire, so a hot key never goes cold; otter and theine can save the
-cache to a file and load it back; sturdyc coalesces refreshes into batches and can sit in
-front of a distributed store. sturdyc can also hold several value types in one cache, with
-typed package-level functions on top, though its capacity is a count of entries rather than
-bytes.
+They also do things this library does not. otter and theine can save the cache to a file
+and load it back; sturdyc retries failed refreshes, coalesces refreshes from many requests
+into batches and can sit in front of a distributed store. sturdyc can also hold several
+value types in one cache, with typed package-level functions on top, though its capacity is
+a count of entries rather than bytes.
 
 What is left is the combination rather than any single feature: a byte budget that refuses
 what does not fit, missing records charged against that budget, and value types with costs
-of their own [under one budget](#several-value-types-under-one-budget). If background
-refresh matters more to you than that, otter or sturdyc is the better fit.
+of their own [under one budget](#several-value-types-under-one-budget).
 
 ## When to use something else
 
@@ -586,7 +628,7 @@ refresh matters more to you than that, otter or sturdyc is the better fit.
 - Your read path is hot enough that how well a cache scales across cores is a real
   difference → otter or [ristretto](https://github.com/dgraph-io/ristretto); with ristretto,
   budget for `Wait()` in the tests.
-- You call an upstream API and want entries refreshed before they expire, refreshes
+- You call an upstream API and want refreshes retried, refreshes from many requests
   coalesced into batches, or a distributed store behind the cache →
   [sturdyc](https://github.com/viccon/sturdyc).
 - You are caching hundreds of megabytes and GC pressure from millions of live pointers is

@@ -145,6 +145,31 @@ func BenchmarkGetOrLoad(b *testing.B) {
 	}
 }
 
+// BenchmarkGetOrLoadRefreshAfter is BenchmarkGetOrLoad with RefreshAfter set
+// and nothing due yet, which is where a refreshing cache spends nearly all its
+// reads: what it adds is the check of whether the value is due.
+func BenchmarkGetOrLoadRefreshAfter(b *testing.B) {
+	c := New(Options[int, int]{
+		TTL:          time.Hour,
+		RefreshAfter: 30 * time.Minute,
+		MaxBytes:     benchKeys,
+		Cost:         unitCost[int](),
+		Loader: func(_ context.Context, key int) (int, error) {
+			return key, nil
+		},
+	})
+	defer c.Close()
+	for i := range benchKeys {
+		_ = c.Set(i, i)
+	}
+
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := range b.N {
+		_, _ = c.GetOrLoad(ctx, i%benchKeys)
+	}
+}
+
 // BenchmarkGetManyOrLoad is the warm path of a batch: every key is cached, so
 // the loader never runs and what is measured is the lookup of the batch and the
 // map it comes back in, against the same keys fetched one GetOrLoad at a time.

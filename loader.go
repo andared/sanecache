@@ -29,7 +29,7 @@ func (c *Cache[K, V]) GetOrLoad(ctx context.Context, key K) (V, error) {
 
 		return zero, ErrNoLoader
 	}
-	if v, done, err := c.cached(ctx, key); done {
+	if v, done, err := c.cached(ctx, key, c.core.loader); done {
 		return v, err
 	}
 
@@ -57,17 +57,24 @@ func (c *Cache[K, V]) GetOrLoadFunc(ctx context.Context, key K, load func(contex
 
 		return zero, ErrNoLoader
 	}
-	if v, done, err := c.cached(ctx, key); done {
+	loader := func(ctx context.Context, _ K) (V, error) { return load(ctx) }
+	if v, done, err := c.cached(ctx, key, loader); done {
 		return v, err
 	}
 
-	return c.core.load(ctx, key, func(ctx context.Context, _ K) (V, error) { return load(ctx) })
+	return c.core.load(ctx, key, loader)
 }
 
-// cached answers a load from the cache when it can. done is false only when the
-// key is a miss and the caller still has time to wait for a load.
-func (c *Cache[K, V]) cached(ctx context.Context, key K) (v V, done bool, err error) {
-	switch v, st := c.Lookup(key); st {
+// cached answers a load from the cache when it can, starting a refresh with
+// loader when the value it answers with is due for one. done is false only when
+// the key is a miss and the caller still has time to wait for a load.
+func (c *Cache[K, V]) cached(ctx context.Context, key K, loader func(context.Context, K) (V, error)) (v V, done bool, err error) {
+	v, st, _, refresh := c.core.lookup(key, c.core.refresherWith(loader))
+	if refresh {
+		c.core.refresh(ctx, key, loader)
+	}
+
+	switch st {
 	case StatusHit:
 		return v, true, nil
 	case StatusNegative:
@@ -133,7 +140,7 @@ func (c *core[K, V]) load(ctx context.Context, key K, loader func(context.Contex
 	// Without it, a caller descheduled between the two would start a second load
 	// for a value that is already cached. Counted without stats, because the
 	// caller's lookup has already been counted as the miss it was.
-	if v, st, _ := s.get(key, c.now()); st != StatusMiss {
+	if v, st, _, _ := s.get(key, c.now(), refreshNone); st != StatusMiss {
 		s.endLoad(key, token)
 		g.mu.Unlock()
 		c.countCoalesced(s)
@@ -154,9 +161,35 @@ func (c *core[K, V]) load(ctx context.Context, key K, loader func(context.Contex
 	g.calls[key] = cl
 	g.mu.Unlock()
 
-	go c.run(loadCtx, g, s, key, cl, loader)
+	go c.run(loadCtx, g, s, key, cl, loader, false)
 
 	return g.wait(ctx, key, cl)
+}
+
+// refresh reloads key in the background ahead of its expiry. Nobody waits for
+// it, but it is an ordinary flight: a caller that finds the key expired before
+// it finishes joins it, and invalidation keeps its result out. A load for the
+// key that is already running is left to publish instead.
+func (c *core[K, V]) refresh(ctx context.Context, key K, loader func(context.Context, K) (V, error)) {
+	idx := c.shardIndex(key)
+	g, s := c.flights[idx], c.shards[idx]
+
+	g.mu.Lock()
+	if cl, ok := g.calls[key]; ok && cl.token.valid.Load() {
+		g.mu.Unlock()
+
+		return
+	}
+
+	// The refresh is a waiter of its own that never leaves, so that a caller
+	// who joins it and gives up cannot cancel a load the cache asked for.
+	token := s.beginLoad(key)
+	loadCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	cl := &call[V]{done: make(chan struct{}), waiters: 1, cancel: cancel, token: token}
+	g.calls[key] = cl
+	g.mu.Unlock()
+
+	go c.run(loadCtx, g, s, key, cl, loader, true)
 }
 
 func (c *core[K, V]) countCoalesced(s *shard[K, V]) {
@@ -166,16 +199,18 @@ func (c *core[K, V]) countCoalesced(s *shard[K, V]) {
 }
 
 // run performs the load and publishes the result. It runs on its own goroutine
-// so that a caller can walk away from a load without ending it.
+// so that a caller can walk away from a load without ending it. refresh says
+// the load is a refresh, which is counted apart from loads.
 func (c *core[K, V]) run(
-	ctx context.Context, g *flightGroup[K, V], s *shard[K, V], key K, cl *call[V], loader func(context.Context, K) (V, error),
+	ctx context.Context, g *flightGroup[K, V], s *shard[K, V], key K, cl *call[V],
+	loader func(context.Context, K) (V, error), refresh bool,
 ) {
 	defer s.endLoad(key, cl.token)
 	g.run(key, cl, func() (V, error) {
 		v, err := loader(ctx, key)
 		switch {
 		case err == nil:
-			_ = c.setValue(key, v, c.valueCost(v), c.ttl, cl.token)
+			_ = c.setValue(key, v, c.valueCost(v), c.ttl, c.refreshAfter, refreshCache, cl.token)
 		case errors.Is(err, ErrNotFound):
 			_ = c.setNegative(key, c.negativeTTL, cl.token)
 		}
@@ -183,7 +218,7 @@ func (c *core[K, V]) run(
 		return v, err
 	}, func(o loadOutcome) {
 		if c.countStats {
-			s.counters.countLoad(o)
+			s.counters.countLoad(o, refresh)
 		}
 	})
 }

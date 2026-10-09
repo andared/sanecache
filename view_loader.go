@@ -19,7 +19,7 @@ func (v *View[T]) GetOrLoad(ctx context.Context, key string) (T, error) {
 		return zero, ErrNoLoader
 	}
 
-	if val, done, err := v.cached(ctx, key); done {
+	if val, done, err := v.cached(ctx, key, v.loader); done {
 		return val, err
 	}
 
@@ -41,16 +41,17 @@ func (v *View[T]) GetOrLoadFunc(ctx context.Context, key string, load func(conte
 
 		return zero, ErrNoLoader
 	}
-	if val, done, err := v.cached(ctx, key); done {
+	loader := func(ctx context.Context, _ string) (T, error) { return load(ctx) }
+	if val, done, err := v.cached(ctx, key, loader); done {
 		return val, err
 	}
 
-	return v.loadWith(ctx, key, func(ctx context.Context, _ string) (T, error) { return load(ctx) })
+	return v.loadWith(ctx, key, loader)
 }
 
 // cached is Cache.cached for a view.
-func (v *View[T]) cached(ctx context.Context, key string) (val T, done bool, err error) {
-	switch val, st := v.Lookup(key); st {
+func (v *View[T]) cached(ctx context.Context, key string, loader func(context.Context, string) (T, error)) (val T, done bool, err error) {
+	switch val, st := v.lookup(ctx, key, v.refresherWith(loader), loader); st {
 	case StatusHit:
 		return val, true, nil
 	case StatusNegative:
@@ -91,7 +92,7 @@ func (v *View[T]) loadUncached(ctx context.Context, key string, loader func(cont
 
 	go g.run(key, cl, func() (T, error) {
 		return loader(loadCtx, key)
-	}, v.countLoad)
+	}, func(o loadOutcome) { v.countLoad(o, false) })
 
 	return g.wait(ctx, key, cl)
 }
@@ -117,7 +118,7 @@ func (v *View[T]) load(ctx context.Context, key string, loader func(context.Cont
 	token := s.beginLoad(fullKey)
 	// Recheck without counting another lookup: a load may have published since
 	// the caller's miss. A value of a different type still needs a typed load.
-	raw, st, _ := s.get(fullKey, c.now())
+	raw, st, _, _ := s.get(fullKey, c.now(), refreshNone)
 	val, typed := raw.(T)
 	if st == StatusNegative || (st == StatusHit && typed) {
 		s.endLoad(fullKey, token)
@@ -136,25 +137,56 @@ func (v *View[T]) load(ctx context.Context, key string, loader func(context.Cont
 	g.calls[key] = cl
 	g.mu.Unlock()
 
-	go func() {
-		defer s.endLoad(fullKey, token)
-		g.run(key, cl, func() (T, error) {
-			value, err := loader(loadCtx, key)
-			switch {
-			case err == nil:
-				_ = c.setValue(fullKey, value, v.valueCost(value), v.ttl, token)
-			case errors.Is(err, ErrNotFound):
-				_ = c.setNegative(fullKey, v.negativeTTL, token)
-			}
-
-			return value, err
-		}, func(o loadOutcome) {
-			v.countLoad(o)
-			if v.countStats {
-				s.counters.countLoad(o)
-			}
-		})
-	}()
+	go v.run(loadCtx, g, s, key, cl, loader, false)
 
 	return g.wait(ctx, key, cl)
+}
+
+// refresh is Cache's refresh for a view's key, with the view's loader.
+func (v *View[T]) refresh(ctx context.Context, key string, loader func(context.Context, string) (T, error)) {
+	c := v.cache.core
+	fullKey := v.prefix + key
+	idx := c.shardIndex(fullKey)
+	g, s := v.flights[idx], c.shards[idx]
+
+	g.mu.Lock()
+	if cl, ok := g.calls[key]; ok && cl.token.valid.Load() {
+		g.mu.Unlock()
+
+		return
+	}
+	token := s.beginLoad(fullKey)
+	loadCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	cl := &call[T]{done: make(chan struct{}), waiters: 1, cancel: cancel, token: token}
+	g.calls[key] = cl
+	g.mu.Unlock()
+
+	go v.run(loadCtx, g, s, key, cl, loader, true)
+}
+
+// run is Cache's run for a view's key: the result is stored under the prefixed
+// key, with the view's cost and lifetimes, and counted for the view too.
+func (v *View[T]) run(
+	ctx context.Context, g *flightGroup[string, T], s *shard[string, any], key string, cl *call[T],
+	loader func(context.Context, string) (T, error), refresh bool,
+) {
+	c := v.cache.core
+	fullKey := v.prefix + key
+	defer s.endLoad(fullKey, cl.token)
+	g.run(key, cl, func() (T, error) {
+		value, err := loader(ctx, key)
+		switch {
+		case err == nil:
+			_ = c.setValue(fullKey, value, v.valueCost(value), v.ttl, v.refreshAfter, refreshView, cl.token)
+		case errors.Is(err, ErrNotFound):
+			_ = c.setNegative(fullKey, v.negativeTTL, cl.token)
+		}
+
+		return value, err
+	}, func(o loadOutcome) {
+		v.countLoad(o, refresh)
+		if v.countStats {
+			s.counters.countLoad(o, refresh)
+		}
+	})
 }

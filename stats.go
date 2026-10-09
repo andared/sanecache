@@ -32,6 +32,15 @@ type Stats struct {
 	// after it published. Against Loads it says how much the single flight is
 	// actually saving.
 	Coalesced int64
+	// Refreshes counts the reloads RefreshAfter started that finished, however
+	// they ended, a key at a time as Loads does. They are not in Loads: Loads is
+	// what misses cost the upstream, and Refreshes is what keeping hot keys warm
+	// costs it instead.
+	Refreshes int64
+	// RefreshErrors counts the refreshes that failed or panicked. The value they
+	// meant to replace stays until its TTL runs out. A refresh that ended in
+	// ErrNotFound is not one of them.
+	RefreshErrors int64
 
 	Entries int   // entries currently held, expired-but-not-yet-swept included
 	Bytes   int64 // sum of the costs of those entries
@@ -63,10 +72,21 @@ func (c *counters) addTo(s *Stats) {
 	s.LoadErrors += c.loadErrors.Load()
 	s.Batches += c.batches.Load()
 	s.Coalesced += c.coalesced.Load()
+	s.Refreshes += c.refreshes.Load()
+	s.RefreshErrors += c.refreshErrors.Load()
 }
 
-// countLoad records one completed load.
-func (c *counters) countLoad(o loadOutcome) {
+// countLoad records one completed load, or refresh when it was one.
+func (c *counters) countLoad(o loadOutcome, refresh bool) {
+	if refresh {
+		c.refreshes.Add(1)
+		if o == loadFailed {
+			c.refreshErrors.Add(1)
+		}
+
+		return
+	}
+
 	c.loads.Add(1)
 	switch o {
 	case loadNotFound:
@@ -77,17 +97,19 @@ func (c *counters) countLoad(o loadOutcome) {
 }
 
 type counters struct {
-	hits         atomic.Int64
-	misses       atomic.Int64
-	negatives    atomic.Int64
-	typeMisses   atomic.Int64
-	evictions    atomic.Int64
-	expirations  atomic.Int64
-	replacements atomic.Int64
-	rejections   atomic.Int64
-	loads        atomic.Int64
-	loadNotFound atomic.Int64
-	loadErrors   atomic.Int64
-	batches      atomic.Int64
-	coalesced    atomic.Int64
+	hits          atomic.Int64
+	misses        atomic.Int64
+	negatives     atomic.Int64
+	typeMisses    atomic.Int64
+	evictions     atomic.Int64
+	expirations   atomic.Int64
+	replacements  atomic.Int64
+	rejections    atomic.Int64
+	loads         atomic.Int64
+	loadNotFound  atomic.Int64
+	loadErrors    atomic.Int64
+	batches       atomic.Int64
+	coalesced     atomic.Int64
+	refreshes     atomic.Int64
+	refreshErrors atomic.Int64
 }

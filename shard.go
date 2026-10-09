@@ -12,9 +12,42 @@ type entry[K comparable, V any] struct {
 	value     V
 	cost      int64
 	expiresAt int64 // unix nanoseconds; 0 means "never expires"
-	negative  bool  // upstream said this key does not exist
+
+	// refreshAt is when a read able to load should start reloading the entry in
+	// the background, in unix nanoseconds; 0 means never. It is atomic because
+	// the read that claims the refresh may hold only the read lock, and claiming
+	// is a swap to 0: one refresh per stored value, however many reads see it due.
+	refreshAt atomic.Int64
+
+	negative bool // upstream said this key does not exist
+	// byView marks an entry a View wrote. Only a view refreshes it, with its own
+	// loader: the cache's loader would be handed the view's prefixed key.
+	byView bool
 
 	prev, next *entry[K, V] // head of the list is the most recently used entry
+}
+
+// refresher says which reader may claim an entry's refresh: nobody, the cache
+// itself, or a view. It is also what a write records as the entry's owner.
+type refresher uint8
+
+const (
+	refreshNone refresher = iota
+	refreshCache
+	refreshView
+)
+
+// claimRefresh reports whether this read, by a reader that can refresh, is the
+// one to refresh e. The caller holds the shard lock, read or write, and checks
+// for refreshNone itself: reads that cannot refresh are most reads, and they
+// should not pay for a call.
+func (e *entry[K, V]) claimRefresh(by refresher, now int64) bool {
+	if e.byView != (by == refreshView) {
+		return false
+	}
+	at := e.refreshAt.Load()
+
+	return at != 0 && now >= at && e.refreshAt.CompareAndSwap(at, 0)
 }
 
 func (e *entry[K, V]) expired(now int64) bool {
@@ -66,10 +99,11 @@ func newShard[K comparable, V any](maxBytes int64, maxEntries int, policy Policy
 	}
 }
 
-// get returns the entry's value along with its status. The third result reports
-// that the lookup landed on an entry that had already expired, so the caller can
-// account for it separately from a plain miss.
-func (s *shard[K, V]) get(key K, now int64) (V, Status, bool) {
+// get returns the entry's value along with its status. expired reports that the
+// lookup landed on an entry that had already expired, so the caller can account
+// for it separately from a plain miss. refresh reports that the hit was due for a
+// refresh and that this reader, being the kind given by by, claimed it.
+func (s *shard[K, V]) get(key K, now int64, by refresher) (_ V, _ Status, expired, refresh bool) {
 	var zero V
 
 	// Under ClearOnFull nothing is reordered on access, so reads take only the
@@ -80,7 +114,7 @@ func (s *shard[K, V]) get(key K, now int64) (V, Status, bool) {
 		e, ok := s.items[key]
 		if !ok {
 			s.mu.RUnlock()
-			return zero, StatusMiss, false
+			return zero, StatusMiss, false, false
 		}
 		if e.expired(now) {
 			s.mu.RUnlock()
@@ -97,16 +131,19 @@ func (s *shard[K, V]) get(key K, now int64) (V, Status, bool) {
 			}
 			s.mu.Unlock()
 
-			return zero, StatusMiss, removed
+			return zero, StatusMiss, removed, false
 		}
 
 		status, value := StatusHit, e.value
 		if e.negative {
 			status, value = StatusNegative, zero
 		}
+		if by != refreshNone {
+			refresh = e.claimRefresh(by, now)
+		}
 		s.mu.RUnlock()
 
-		return value, status, false
+		return value, status, false, refresh
 	}
 
 	s.mu.Lock()
@@ -114,19 +151,23 @@ func (s *shard[K, V]) get(key K, now int64) (V, Status, bool) {
 
 	e, ok := s.items[key]
 	if !ok {
-		return zero, StatusMiss, false
+		return zero, StatusMiss, false, false
 	}
 	if e.expired(now) {
 		s.remove(e)
-		return zero, StatusMiss, true
+		return zero, StatusMiss, true, false
 	}
 
 	s.touch(e)
 	if e.negative {
-		return zero, StatusNegative, false
+		return zero, StatusNegative, false, false
 	}
 
-	return e.value, StatusHit, false
+	if by != refreshNone {
+		refresh = e.claimRefresh(by, now)
+	}
+
+	return e.value, StatusHit, false, refresh
 }
 
 // set stores e, returning the entry it replaced (if any) and the entries evicted
