@@ -17,16 +17,6 @@ const (
 	refreshAfter = 5 * time.Minute
 )
 
-// manualClock makes the cache read its time from a counter the test moves, so
-// that "the value is now due" is a step in the test rather than a sleep. It must
-// be installed before the first write.
-func manualClock[K comparable, V any](c *Cache[K, V]) (advance func(time.Duration)) {
-	c.core.coarse = new(atomic.Int64)
-	c.core.coarse.Store(time.Now().UnixNano())
-
-	return func(d time.Duration) { c.core.coarse.Add(int64(d)) }
-}
-
 // flying reports whether a load for key is registered, which refresh does
 // before it returns: a test can tell "no refresh was started" without waiting.
 func flying[V any](c *Cache[string, V], key string) bool {
@@ -379,17 +369,13 @@ func TestGetManyOrLoadRefreshesDueKeysInOneBatch(t *testing.T) {
 	waitFor(t, "the refresh batch", func() bool { return c.Stats().Refreshes == 3 })
 
 	rec.mu.Lock()
-	batches := slices.Clone(rec.batches)
-	rec.mu.Unlock()
-	sorted := make([]string, 0, len(batches))
-	for _, b := range batches {
-		b = slices.Clone(b)
-		slices.Sort(b)
-		sorted = append(sorted, strings.Join(b, ","))
+	var batches []string
+	for _, b := range rec.batches {
+		batches = append(batches, strings.Join(sorted(b), ","))
 	}
-	slices.Sort(sorted)
-	if want := []string{"a,b,c", "a,b,c", "d"}; !slices.Equal(sorted, want) {
-		t.Fatalf("batches %v, want %v", sorted, want)
+	rec.mu.Unlock()
+	if want := []string{"a,b,c", "a,b,c", "d"}; !slices.Equal(sorted(batches), want) {
+		t.Fatalf("batches %v, want %v", batches, want)
 	}
 	if st := c.Stats(); st.Batches != 3 || st.Loads != 4 {
 		t.Fatalf("stats: %+v", st)
@@ -529,23 +515,20 @@ func TestRefreshLeavesARunningLoadToPublish(t *testing.T) {
 
 		return 0, nil
 	}
-	running := func(c *core[string, int], key string) *call[int] {
-		token := &loadToken{}
-		token.valid.Store(true)
-		cl := &call[int]{done: make(chan struct{}), token: token}
-		g := c.flights[c.shardIndex(key)]
-		g.mu.Lock()
+	running := func(g *flightGroup[string, int], key string) *call[int] {
+		cl := &call[int]{done: make(chan struct{}), token: &loadToken{}}
+		cl.token.valid.Store(true)
 		g.calls[key] = cl
-		g.mu.Unlock()
 
 		return cl
 	}
 
 	c := New(Options[string, int]{TTL: refreshTTL, RefreshAfter: refreshAfter, Loader: never, DisableCleanup: true})
 	defer c.Close()
-	cl := running(c.core, "k")
+	g := c.core.flights[c.core.shardIndex("k")]
+	cl := running(g, "k")
 	c.core.refresh(context.Background(), "k", never)
-	if g := c.core.flights[c.core.shardIndex("k")]; g.calls["k"] != cl {
+	if g.calls["k"] != cl {
 		t.Fatal("refresh replaced the running load")
 	}
 
@@ -558,22 +541,17 @@ func TestRefreshLeavesARunningLoadToPublish(t *testing.T) {
 		},
 	})
 	defer b.Close()
-	running(b.core, "x")
-	running(b.core, "y")
+	running(b.core.flights[b.core.shardIndex("x")], "x")
+	running(b.core.flights[b.core.shardIndex("y")], "y")
 	b.core.refreshMany(context.Background(), []string{"x", "y"})
 
 	vc := New(Options[string, any]{TTL: refreshTTL, DisableCleanup: true})
 	defer vc.Close()
 	v := NewView(vc, ViewOptions[int]{Name: "v", RefreshAfter: refreshAfter, Loader: never})
-	g := v.flights[vc.core.shardIndex("v:k")]
-	token := &loadToken{}
-	token.valid.Store(true)
-	vcl := &call[int]{done: make(chan struct{}), token: token}
-	g.mu.Lock()
-	g.calls["k"] = vcl
-	g.mu.Unlock()
+	vg := v.flights[vc.core.shardIndex("v:k")]
+	vcl := running(vg, "k")
 	v.refresh(context.Background(), "k", never)
-	if g.calls["k"] != vcl {
+	if vg.calls["k"] != vcl {
 		t.Fatal("a view refresh replaced the running load")
 	}
 
