@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -23,6 +24,16 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+// manualClock makes the cache read its time from a counter the test moves, so
+// that expiry is a step in the test rather than a sleep. Install it before the
+// first write.
+func manualClock[K comparable, V any](c *Cache[K, V]) (advance func(time.Duration)) {
+	c.core.coarse = new(atomic.Int64)
+	c.core.coarse.Store(time.Now().UnixNano())
+
+	return func(d time.Duration) { c.core.coarse.Add(int64(d)) }
 }
 
 func TestGetSet(t *testing.T) {

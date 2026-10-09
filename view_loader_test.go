@@ -53,8 +53,7 @@ func TestViewLoaderPolicies(t *testing.T) {
 			c := New(Options[string, any]{TTL: time.Hour, NegativeTTL: time.Hour, MaxBytes: 1000, Cost: func(any) int64 { return 1 }, DisableStats: disabled, DisableCleanup: true})
 			defer c.Close()
 			// Drive expiry explicitly so scheduler delays cannot expire recheck fixtures.
-			c.core.coarse = new(atomic.Int64)
-			c.core.coarse.Store(time.Now().UnixNano())
+			advance := manualClock(c)
 			var calls int
 			v := NewView(c, ViewOptions[string]{Name: "text", TTL: 100 * time.Millisecond, NegativeTTL: 100 * time.Millisecond, Cost: func(s string) int64 { return int64(len(s)) }, Loader: func(_ context.Context, key string) (string, error) {
 				calls++
@@ -90,7 +89,7 @@ func TestViewLoaderPolicies(t *testing.T) {
 			if _, err := v.GetOrLoad(ctx, "gone"); err != ErrNotFound {
 				t.Fatalf("cached negative: %v", err)
 			}
-			c.core.coarse.Add(int64(150 * time.Millisecond))
+			advance(150 * time.Millisecond)
 			if _, st := v.Lookup("k"); st != StatusMiss {
 				t.Fatal("view TTL ignored")
 			}
@@ -284,8 +283,7 @@ func TestViewLoadsShareBudgetAndInheritOptions(t *testing.T) {
 		t.Run(fmt.Sprint(policy), func(t *testing.T) {
 			c := New(Options[string, any]{MaxBytes: 512, Cost: func(any) int64 { return 256 }, TTL: time.Minute, NegativeTTL: time.Minute, DisableCleanup: true, Policy: policy})
 			defer c.Close()
-			c.core.coarse = new(atomic.Int64)
-			c.core.coarse.Store(time.Now().UnixNano())
+			advance := manualClock(c)
 			ints := NewView(c, ViewOptions[int]{Name: "int", Loader: func(context.Context, string) (int, error) { return 7, nil }})
 			texts := NewView(c, ViewOptions[string]{Name: "text", Loader: func(_ context.Context, key string) (string, error) {
 				if key == "gone" {
@@ -315,7 +313,7 @@ func TestViewLoadsShareBudgetAndInheritOptions(t *testing.T) {
 			if _, st := texts.Lookup("gone"); st != StatusNegative {
 				t.Fatal("negative TTL not inherited")
 			}
-			c.core.coarse.Add(int64(2 * time.Minute))
+			advance(2 * time.Minute)
 			if _, st := texts.Lookup("next"); st != StatusMiss {
 				t.Fatal("TTL not inherited")
 			}
