@@ -18,6 +18,9 @@ While the major version is 0, the public API may change in any release.
 - `SetWithCost` and `GetOrLoadFuncWithCost` on `Cache` and `View`: the value's cost comes
   with it instead of from the `Cost` function, for values whose size is known only where
   they are produced, such as the length of the response they were decoded from.
+- `Stats.Sub` and `ViewStats.Sub`: the counters gained since a previous snapshot, which is
+  what a metrics exporter sends each interval. A counter that went down, from a cache
+  created anew, comes back whole.
 
 ### Changed
 

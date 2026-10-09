@@ -323,6 +323,23 @@ type ViewStats struct {
 	RefreshErrors int64 // refreshes that failed or panicked
 }
 
+// Sub is Stats.Sub for a view.
+func (s ViewStats) Sub(prev ViewStats) ViewStats {
+	for _, f := range []struct {
+		cur  *int64
+		prev int64
+	}{
+		{&s.Hits, prev.Hits}, {&s.Misses, prev.Misses}, {&s.Negatives, prev.Negatives},
+		{&s.TypeMisses, prev.TypeMisses}, {&s.Loads, prev.Loads}, {&s.LoadNotFound, prev.LoadNotFound},
+		{&s.LoadErrors, prev.LoadErrors}, {&s.Coalesced, prev.Coalesced},
+		{&s.Refreshes, prev.Refreshes}, {&s.RefreshErrors, prev.RefreshErrors},
+	} {
+		*f.cur = since(*f.cur, f.prev)
+	}
+
+	return s
+}
+
 // HitRate reports hits as a fraction of all lookups, counting a cached negative
 // as a hit and a type miss as a miss.
 func (s ViewStats) HitRate() float64 {

@@ -43,6 +43,36 @@ func (s Stats) HitRate() float64 {
 	return float64(s.Hits+s.Negatives) / float64(total)
 }
 
+// Sub returns the counters gained since prev, which is what an exporter sends
+// each interval. A counter below its value in prev means the cache was created
+// anew, and is returned whole. Entries and Bytes are s's own.
+func (s Stats) Sub(prev Stats) Stats {
+	for _, f := range []struct {
+		cur  *int64
+		prev int64
+	}{
+		{&s.Hits, prev.Hits}, {&s.Misses, prev.Misses}, {&s.Negatives, prev.Negatives},
+		{&s.Evictions, prev.Evictions}, {&s.Expirations, prev.Expirations},
+		{&s.Replacements, prev.Replacements}, {&s.Rejections, prev.Rejections},
+		{&s.TypeMisses, prev.TypeMisses}, {&s.Loads, prev.Loads}, {&s.LoadNotFound, prev.LoadNotFound},
+		{&s.LoadErrors, prev.LoadErrors}, {&s.Batches, prev.Batches}, {&s.Coalesced, prev.Coalesced},
+		{&s.Refreshes, prev.Refreshes}, {&s.RefreshErrors, prev.RefreshErrors},
+	} {
+		*f.cur = since(*f.cur, f.prev)
+	}
+
+	return s
+}
+
+// since is how much a counter grew from prev, or all of it if it was reset.
+func since(cur, prev int64) int64 {
+	if cur < prev {
+		return cur
+	}
+
+	return cur - prev
+}
+
 // addTo folds one shard's counters into a snapshot.
 func (c *counters) addTo(s *Stats) {
 	s.Hits += c.hits.Load()
