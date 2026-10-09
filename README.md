@@ -385,7 +385,8 @@ for name, vs := range c.ViewStats() {
 }
 ```
 
-Alert on `Rejections`: keys that can never be cached. `Coalesced` against `Loads` is what
+`s.Sub(prev)` is what was gained since the previous snapshot, the increments a statsd
+exporter sends. Alert on `Rejections`: keys that can never be cached. `Coalesced` against `Loads` is what
 single flight saves. `LoadErrors` leaves out `ErrNotFound`, which is in `LoadNotFound`, so
 ids that are gone do not look like failures.
 
