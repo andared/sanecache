@@ -50,18 +50,10 @@ func (v *View[T]) GetOrLoadFunc(ctx context.Context, key string, load func(conte
 }
 
 // cached is Cache.cached for a view.
-func (v *View[T]) cached(ctx context.Context, key string, loader func(context.Context, string) (T, error)) (val T, done bool, err error) {
-	switch val, st := v.lookup(ctx, key, v.refresherWith(loader), loader); st {
-	case StatusHit:
-		return val, true, nil
-	case StatusNegative:
-		return val, true, ErrNotFound
-	}
-	if err := ctx.Err(); err != nil {
-		return val, true, err
-	}
+func (v *View[T]) cached(ctx context.Context, key string, loader func(context.Context, string) (T, error)) (T, bool, error) {
+	val, st := v.lookup(ctx, key, v.refresherWith(loader), loader)
 
-	return val, false, nil
+	return answered(ctx, val, st)
 }
 
 func (v *View[T]) loadWith(ctx context.Context, key string, loader func(context.Context, string) (T, error)) (T, error) {
@@ -78,21 +70,16 @@ func (v *View[T]) loadUncached(ctx context.Context, key string, loader func(cont
 	g := v.flights[0]
 
 	g.mu.Lock()
-	if cl, ok := g.calls[key]; ok {
+	if cl := g.running(key); cl != nil {
 		cl.waiters++
 		g.mu.Unlock()
 		v.count(&v.stats.coalesced)
 
 		return g.wait(ctx, key, cl)
 	}
-	loadCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	cl := &call[T]{done: make(chan struct{}), waiters: 1, cancel: cancel}
-	g.calls[key] = cl
-	g.mu.Unlock()
-
-	go g.run(key, cl, func() (T, error) {
-		return loader(loadCtx, key)
-	}, func(o loadOutcome) { v.countLoad(o, false) })
+	cl := g.startAndUnlock(ctx, key, nil, func(ctx context.Context, cl *call[T]) {
+		g.run(key, cl, func() (T, error) { return loader(ctx, key) }, func(o loadOutcome) { v.stats.countLoad(o, false) })
+	})
 
 	return g.wait(ctx, key, cl)
 }
@@ -108,7 +95,7 @@ func (v *View[T]) load(ctx context.Context, key string, loader func(context.Cont
 	}
 
 	g.mu.Lock()
-	if cl, ok := g.calls[key]; ok && cl.token.valid.Load() {
+	if cl := g.running(key); cl != nil {
 		cl.waiters++
 		g.mu.Unlock()
 		coalesced()
@@ -132,12 +119,9 @@ func (v *View[T]) load(ctx context.Context, key string, loader func(context.Cont
 
 		return val, nil
 	}
-	loadCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	cl := &call[T]{done: make(chan struct{}), waiters: 1, cancel: cancel, token: token}
-	g.calls[key] = cl
-	g.mu.Unlock()
-
-	go v.run(loadCtx, g, s, key, cl, loader, false)
+	cl := g.startAndUnlock(ctx, key, token, func(ctx context.Context, cl *call[T]) {
+		v.run(ctx, g, s, key, cl, loader, false)
+	})
 
 	return g.wait(ctx, key, cl)
 }
@@ -150,18 +134,14 @@ func (v *View[T]) refresh(ctx context.Context, key string, loader func(context.C
 	g, s := v.flights[idx], c.shards[idx]
 
 	g.mu.Lock()
-	if cl, ok := g.calls[key]; ok && cl.token.valid.Load() {
+	if g.running(key) != nil {
 		g.mu.Unlock()
 
 		return
 	}
-	token := s.beginLoad(fullKey)
-	loadCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	cl := &call[T]{done: make(chan struct{}), waiters: 1, cancel: cancel, token: token}
-	g.calls[key] = cl
-	g.mu.Unlock()
-
-	go v.run(loadCtx, g, s, key, cl, loader, true)
+	g.startAndUnlock(ctx, key, s.beginLoad(fullKey), func(ctx context.Context, cl *call[T]) {
+		v.run(ctx, g, s, key, cl, loader, true)
+	})
 }
 
 // run is Cache's run for a view's key: the result is stored under the prefixed
@@ -184,8 +164,8 @@ func (v *View[T]) run(
 
 		return value, err
 	}, func(o loadOutcome) {
-		v.countLoad(o, refresh)
 		if v.countStats {
+			v.stats.countLoad(o, refresh)
 			s.counters.countLoad(o, refresh)
 		}
 	})

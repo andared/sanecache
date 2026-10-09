@@ -259,7 +259,7 @@ type core[K comparable, V any] struct {
 	// share a namespace in storage, so they share counters too; the map only
 	// grows with the number of distinct names, which is fixed by the program.
 	viewsMu sync.Mutex
-	views   map[string]*viewCounters
+	views   map[string]*counters
 
 	// coarse holds the time a background goroutine last read, in unix
 	// nanoseconds, or nil when the cache reads the clock itself. Zero means the
@@ -412,26 +412,10 @@ func (c *Cache[K, V]) Clear() {
 }
 
 // Len reports how many entries are held, including expired ones not yet swept.
-func (c *Cache[K, V]) Len() int {
-	n := 0
-	for _, s := range c.core.shards {
-		entries, _ := s.stats()
-		n += entries
-	}
-
-	return n
-}
+func (c *Cache[K, V]) Len() int { return c.Stats().Entries }
 
 // Bytes reports the summed cost of the entries held.
-func (c *Cache[K, V]) Bytes() int64 {
-	var total int64
-	for _, s := range c.core.shards {
-		_, bytes := s.stats()
-		total += bytes
-	}
-
-	return total
-}
+func (c *Cache[K, V]) Bytes() int64 { return c.Stats().Bytes }
 
 // Stats returns a snapshot of the counters. It walks every shard, so poll it on
 // a metrics interval rather than per request.
