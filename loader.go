@@ -9,20 +9,15 @@ import (
 )
 
 // GetOrLoad returns the cached value, calling Options.Loader when there is none,
-// or Options.BatchLoader with this one key when there is no Loader.
-// Callers that ask for the same key while a load is running wait for it instead
-// of starting their own, so a cold key costs one upstream call rather than one
-// per concurrent caller.
+// or Options.BatchLoader with this one key when there is no Loader. Callers of a
+// key whose load is running wait for it instead of starting their own.
 //
-// A cached "does not exist" answer is reported as ErrNotFound without calling
-// the loader. A loaded value is stored before this returns, so the next caller
-// finds it cached; a value too large for the budget is still returned, counted
-// as a rejection rather than quietly retried forever. Invalidation or a successful
-// write during loading suppresses publication, but the waiting callers still
-// receive the loader result. New callers do not join invalidated loads.
-//
-// Errors other than ErrNotFound are returned as the loader produced them and are
-// not cached, so the next call tries again.
+// A cached "does not exist" is reported as ErrNotFound. A loaded value is
+// stored before this returns; one too large for the budget is still returned,
+// and counted as a rejection. Invalidation or a successful write during the
+// load keeps its result out of the cache, though its waiters still get it, and
+// new callers start a new load. Other errors are returned as the loader
+// produced them and are not cached.
 func (c *Cache[K, V]) GetOrLoad(ctx context.Context, key K) (V, error) {
 	if c.core.loader == nil {
 		var zero V
@@ -36,21 +31,10 @@ func (c *Cache[K, V]) GetOrLoad(ctx context.Context, key K) (V, error) {
 	return c.core.load(ctx, key, c.core.loader)
 }
 
-// GetOrLoadFunc is GetOrLoad with the loader passed by the caller instead of
-// taken from Options. It is for upstream calls that need more than the key to
-// make — the parameters a key only summarises, a request the caller has already
-// built — which a loader would otherwise have to parse back out of the key.
-//
-// Everything else is GetOrLoad's: single flight, storage with the cache's Cost
-// and TTLs, ErrNotFound kept as a negative entry, the error, cancellation and
-// panic policies, and the counters. A load for the key already running, whether
-// GetOrLoad, GetManyOrLoad or another GetOrLoadFunc started it, is waited for
-// rather than repeated. That is the one rule the method adds: callers of a key
-// share whichever load started first, so load must produce what any other
-// caller's function would for that key.
-//
-// Options.Loader and Options.BatchLoader are not needed. A nil load returns
-// ErrNoLoader.
+// GetOrLoadFunc is GetOrLoad with the loader passed in, for upstream calls that
+// need more than the key. A running load of the key, whoever started it, is
+// waited for instead, so load must return what any caller's would for that key.
+// Options.Loader is not needed; a nil load returns ErrNoLoader.
 func (c *Cache[K, V]) GetOrLoadFunc(ctx context.Context, key K, load func(context.Context) (V, error)) (V, error) {
 	if load == nil {
 		var zero V
@@ -65,9 +49,8 @@ func (c *Cache[K, V]) GetOrLoadFunc(ctx context.Context, key K, load func(contex
 	return c.core.load(ctx, key, loader)
 }
 
-// cached answers a load from the cache when it can, starting a refresh with
-// loader when the value it answers with is due for one. done is false only when
-// the key is a miss and the caller still has time to wait for a load.
+// cached answers a load from the cache when it can, starting the refresh it
+// claims with loader. It reports false only for a miss the caller can wait for.
 func (c *Cache[K, V]) cached(ctx context.Context, key K, loader func(context.Context, K) (V, error)) (V, bool, error) {
 	v, st, _, refresh := c.core.lookup(key, c.core.refresherWith(loader))
 	if refresh {
@@ -91,8 +74,7 @@ func answered[V any](ctx context.Context, v V, st Status) (V, bool, error) {
 	return v, err != nil, err
 }
 
-// call is one load in flight. Waiters read val and err only after done is
-// closed, which is what publishes them.
+// call is one load in flight. Closing done publishes val, err and pan.
 type call[V any] struct {
 	done  chan struct{}
 	val   V
@@ -100,16 +82,14 @@ type call[V any] struct {
 	pan   *loaderPanic
 	token *loadToken
 
-	// waiters and cancel are guarded by the group's mutex. The count exists so
-	// that one caller giving up does not cancel the load the others are waiting
-	// for; the last one out cancels it.
+	// Guarded by the group's mutex. The last waiter to give up cancels the load,
+	// rather than the first.
 	waiters int
 	cancel  context.CancelFunc
 }
 
-// flightGroup tracks the loads in flight for one shard's worth of keys. It has
-// its own mutex rather than the shard's: a load is slow, and the map lookup that
-// joins one should not queue behind reads of the shard it belongs to.
+// flightGroup tracks the loads in flight for one shard's keys, under a mutex of
+// its own so that joining a load does not queue behind the shard's reads.
 type flightGroup[K comparable, V any] struct {
 	mu    sync.Mutex
 	calls map[K]*call[V]
@@ -131,9 +111,7 @@ func (g *flightGroup[K, V]) running(key K) *call[V] {
 }
 
 // startAndUnlock registers a load of key with one waiter, unlocks g.mu and runs
-// the load on a goroutine of its own. The load outlives the caller that starts
-// it, so it takes the caller's values but not its cancellation: see
-// call.waiters.
+// it on its own goroutine, with the caller's values but not its cancellation.
 func (g *flightGroup[K, V]) startAndUnlock(
 	ctx context.Context, key K, token *loadToken, run func(context.Context, *call[V]),
 ) *call[V] {
@@ -169,13 +147,9 @@ func (c *core[K, V]) load(ctx context.Context, key K, loader func(context.Contex
 
 	token := s.beginLoad(key)
 
-	// The caller's own lookup happened before this lock, and a load that
-	// finished in between is gone from the map by now — but it publishes its
-	// value before it leaves, so looking again here, where no load can slip
-	// past, is what makes "one load per key" exact rather than nearly true.
-	// Without it, a caller descheduled between the two would start a second load
-	// for a value that is already cached. Counted without stats, because the
-	// caller's lookup has already been counted as the miss it was.
+	// A load that finished since the caller's lookup has left the map but
+	// published first, so looking again under the lock makes "one load per key"
+	// exact. Not counted: the caller's lookup already was.
 	if v, st, _, _ := s.get(key, c.now(), refreshNone); st != StatusMiss {
 		s.endLoad(key, token)
 		g.mu.Unlock()
@@ -197,10 +171,8 @@ func (c *core[K, V]) load(ctx context.Context, key K, loader func(context.Contex
 	return g.wait(ctx, key, cl)
 }
 
-// refresh reloads key in the background ahead of its expiry. Nobody waits for
-// it, but it is an ordinary flight: a caller that finds the key expired before
-// it finishes joins it, and invalidation keeps its result out. A load for the
-// key that is already running is left to publish instead.
+// refresh reloads key in the background ahead of its expiry, as an ordinary
+// flight that callers may join, unless a load of the key is already running.
 func (c *core[K, V]) refresh(ctx context.Context, key K, loader func(context.Context, K) (V, error)) {
 	idx := c.shardIndex(key)
 	g, s := c.flights[idx], c.shards[idx]
@@ -225,9 +197,8 @@ func (c *core[K, V]) countCoalesced(s *shard[K, V]) {
 	}
 }
 
-// run performs the load and publishes the result. It runs on its own goroutine
-// so that a caller can walk away from a load without ending it. refresh says
-// the load is a refresh, which is counted apart from loads.
+// run performs the load and publishes the result; refresh says it is counted as
+// a refresh.
 func (c *core[K, V]) run(
 	ctx context.Context, g *flightGroup[K, V], s *shard[K, V], key K, cl *call[V],
 	loader func(context.Context, K) (V, error), refresh bool,
@@ -254,12 +225,8 @@ func (c *core[K, V]) run(
 func (g *flightGroup[K, V]) run(key K, cl *call[V], load func() (V, error), record func(loadOutcome)) {
 	defer cl.cancel()
 
-	// The loader does not run on a caller's goroutine, so a panic in it would
-	// take the process down instead of the request that caused it. Carry it to
-	// the callers, who can recover from it as they would from any other call.
-	// Counted from the deferred path so that a load that panicked is counted
-	// too: a service that recovers panics per request would otherwise see a
-	// loader failing every call and a cache reporting no loads at all.
+	// A panic here would take down the process rather than the request, so it
+	// is carried to the callers instead, and counted as a failed load.
 	defer func() {
 		if r := recover(); r != nil {
 			cl.pan = &loaderPanic{value: r, stack: debug.Stack()}
@@ -289,9 +256,8 @@ func (g *flightGroup[K, V]) wait(ctx context.Context, key K, cl *call[V]) (V, er
 	}
 }
 
-// leave drops one waiter. The last one to go cancels the load and takes it out
-// of the map, so that the next caller starts a fresh one rather than joining a
-// load that is being abandoned.
+// leave drops one waiter. The last one cancels the load and takes it out of the
+// map, so that the next caller does not join an abandoned load.
 func (g *flightGroup[K, V]) leave(key K, cl *call[V]) {
 	g.mu.Lock()
 	cl.waiters--
@@ -306,9 +272,8 @@ func (g *flightGroup[K, V]) leave(key K, cl *call[V]) {
 	}
 }
 
-// finish publishes the result. The call leaves the map first so that a caller
-// arriving after this point starts a new load instead of waiting for a result
-// that has already been handed out.
+// finish publishes the result, taking the call out of the map first so that
+// later callers start a new load.
 func (g *flightGroup[K, V]) finish(key K, cl *call[V]) {
 	g.mu.Lock()
 	g.drop(key, cl)
@@ -322,9 +287,8 @@ type loadOutcome uint8
 
 const (
 	loadOK loadOutcome = iota
-	// loadNotFound is the upstream saying the key does not exist. It is kept
-	// apart from failures: a service asking for ids that are gone is working as
-	// designed, and counting it as an error hides the errors that are real.
+	// loadNotFound is an answer, not a failure: counted as an error, ids that
+	// are gone would hide the errors that are real.
 	loadNotFound
 	loadFailed
 )
@@ -342,8 +306,7 @@ func outcomeOf(err error, pan *loaderPanic) loadOutcome {
 	}
 }
 
-// loaderPanic carries a panic from the loader's goroutine to the callers waiting
-// on it, keeping the stack of where it actually happened.
+// loaderPanic carries a loader's panic, with its stack, to the waiting callers.
 type loaderPanic struct {
 	value any
 	stack []byte

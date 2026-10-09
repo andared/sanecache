@@ -6,13 +6,11 @@
 
 A small in-memory cache for Go that aims to be **predictable before it is fast**.
 
-There is no shortage of Go caches, and several of them are excellent. This one exists
-because the failures that actually cost time in production were never about throughput:
-a write that reports success and is dropped a moment later, a hit rate that quietly
-collapses because every value is too big for the budget, a limit expressed in entries
-when the thing you are protecting is a memory limit, a batch of keys that all expire in
-the same millisecond and stampede the upstream together, and a cold key that a hundred
-concurrent requests each fetch for themselves.
+There are excellent Go caches already. This one exists because the failures that cost time
+in production were never about throughput: a write that reports success and is dropped a
+moment later, a hit rate that collapses because every value is too big for the budget, a
+limit in entries when the thing to protect is memory, keys that all expire in the same
+millisecond, and a cold key that a hundred concurrent requests each fetch for themselves.
 
 ```go
 import "github.com/andared/sanecache"
@@ -50,24 +48,19 @@ func main() {
 }
 ```
 
-With Go 1.24 or newer:
-
 ```sh
 go mod init example.com/cache-demo
 go get github.com/andared/sanecache@v0.7.0
 go run .
 ```
 
-Output: `hello true`.
-
-The same program is in [`examples/basic`](examples/basic). A second
-[runnable example](examples/README.md#caching-an-http-dependency) caches JSON responses from
-a local HTTP server, including HTTP 404 responses as negative entries. Both run in CI.
+Output: `hello true`. The same program is in [`examples/basic`](examples/basic), and
+[a second example](examples/README.md#caching-an-http-dependency) caches JSON responses
+from a local HTTP server, 404s included as negative entries. Both run in CI.
 
 ## Applying a byte budget
 
-In an application with its own `Article` type and `fetch` function, account for each value's
-cost and handle missing records explicitly:
+With your own `Article` type and `fetch` function:
 
 ```go
 c := sanecache.New(sanecache.Options[string, *Article]{
@@ -102,39 +95,27 @@ if err := c.Set(id, article); err != nil {
 
 ## What "sane" means here
 
-**Writes are synchronous.** A value is readable the moment `Set` returns. Caches that
-buffer writes asynchronously are faster on paper and force `Wait()` calls into your tests
-to paper over the gap — and once your tests need it, so does any code that writes a value
-and reads it back in the same request.
+**Writes are synchronous.** A value is readable the moment `Set` returns, so tests need no
+`Wait()`, and neither does code that writes a value and reads it back.
 
-**A value that does not fit is refused, not swallowed.** `Set` returns `ErrTooLarge` when
-the value's cost exceeds its shard's budget. The alternative — accept the write, return
-success, drop the entry during eviction — is invisible: the hit rate does not obviously
-look wrong, and every request for those keys goes to the upstream forever.
+**A value that does not fit is refused.** `Set` returns `ErrTooLarge` when the value costs
+more than its shard's budget, instead of accepting it and evicting it unseen, which sends
+every request for that key to the upstream forever.
 
-**Budgets are in bytes.** A cap on the number of entries tells you nothing about memory
-when entries are documents rather than integers: ten thousand entries is a rounding error
-for `int` values and several gigabytes for HTML templates. `MaxBytes` requires a `Cost`
-function; asking for a byte budget without one is a construction-time panic rather than a
-budget that silently counts entries.
+**Budgets are in bytes.** Ten thousand entries is nothing for `int` values and gigabytes for
+HTML templates. `MaxBytes` without a `Cost` function panics at construction rather than
+quietly counting entries.
 
-**"It does not exist" is an answer.** `SetNegative` records that the upstream was asked and
-said no. Without a first-class form for this, it ends up as a sentinel value smuggled
-inside your value type, which does not survive the type parameter and tends to be charged
-zero cost — making it the one thing eviction can never reclaim. Under a byte budget a
-negative entry is charged what it holds: the entry, its map slot and its key.
+**"It does not exist" is an answer.** `SetNegative` records that the upstream said no,
+instead of a sentinel smuggled into the value type. Under a byte budget a negative entry is
+charged what it holds — entry, map slot and key — so eviction can reclaim it.
 
-**TTLs can be jittered.** `Jitter: 10` spreads each expiry by up to ±10%. Keys warmed
-together by one request otherwise expire together and hit the upstream as one wave.
+**TTLs can be jittered.** `Jitter: 10` spreads each expiry by up to ±10%, so keys warmed
+together do not expire together and hit the upstream as one wave.
 
-**A cold key is fetched once.** `GetOrLoad` runs the loader once per key however many
-callers arrive while it is running.
+**A cold key is fetched once**, however many callers ask for it at the same moment.
 
 ## Loading a cold key once
-
-The byte-budget example above — look up, go to the upstream on a miss, remember the answer,
-remember the absence of one — is the same in every service, and it has a hole in it: on a
-cold key, every concurrent request runs it at the same time.
 
 ```go
 c := sanecache.New(sanecache.Options[string, *Article]{
@@ -158,42 +139,29 @@ case err != nil:
 }
 ```
 
-Three details worth knowing, because they are where implementations differ:
+`GetOrLoad` runs the loader once per key however many callers arrive while it runs. Where
+implementations differ:
 
-**"Does not exist" is one error, wherever it came from.** The loader returns `ErrNotFound`;
-`GetOrLoad` caches that as a negative entry and reports the same `ErrNotFound` to later
-callers. Handling of "no such object" does not depend on whether the cache happened to
-remember it. Translate the upstream's own error once, in the loader, and it stops mattering
-anywhere else.
+- **"Does not exist" is one error.** The loader returns `ErrNotFound`, `GetOrLoad` caches it
+  as a negative entry and returns the same error to later callers. Translate the upstream's
+  own error once, in the loader.
+- **Giving up does not cancel the load for everyone else.** The loader's context carries the
+  first caller's values but is cancelled only once *every* waiting caller has gone. A bare
+  [`singleflight.Group`](https://pkg.go.dev/golang.org/x/sync/singleflight#Group) leaves
+  that to you, and a callback capturing the first caller's context lets its timeout cancel
+  work others still need.
+- **Failures are not cached.** Errors other than `ErrNotFound` are returned unchanged and the
+  next call tries again; single flight already collapses the retry storm.
 
-**Giving up does not cancel the load for everyone else.** The loader's context is not the
-first caller's. It carries that caller's values, but it is cancelled only when *every*
-caller waiting on the result has gone. A bare
-[`singleflight.Group`](https://pkg.go.dev/golang.org/x/sync/singleflight#Group) suppresses
-duplicate calls but takes no context argument and defines no cancellation policy. If its
-callback captures the first caller's context, that caller's timeout can cancel work that
-other callers still need; handling this is the application's responsibility. A caller who
-gives up here gets `ctx.Err()` and leaves the others alone.
-
-**Failures are not cached.** Anything other than `ErrNotFound` is passed back unchanged and
-nothing is stored, so the next call tries again. Single-flight already collapses the retry
-storm; caching the error on top of that would turn a blip into an outage that outlives it.
-
-The loader runs on a goroutine of the cache's own, which is what makes the two points above
-possible. If it panics, the panic is carried to the callers rather than taking the process
-down, and it arrives with the stack of where it actually happened. A load that needs a
-deadline of its own should set one inside the loader, where the right number is known.
-
-A load with no caller left is cancelled. A loader that ignores cancellation can still
-warm the cache, provided its result has not been superseded by an explicit invalidation
-or a successful write, including another loader's publication.
+The loader runs on a goroutine of the cache's own. A panic in it reaches the callers, with
+the stack of where it happened, rather than taking the process down. Set a deadline inside
+the loader, where the right number is known. A loader that ignores cancellation still warms
+the cache, unless the key was invalidated or written in the meantime.
 
 ### When the loader needs more than the key
 
-A loader in `Options` gets the key and nothing else. When the upstream call needs more — a
-query string the key only summarises, a request the caller has already built — the choice
-is between encoding all of it into the key and parsing it back out in the loader, or
-passing the loader in with the call:
+When the upstream call needs more than the key — a query string the key only summarises, a
+request already built — pass the loader in with the call:
 
 ```go
 page, err := c.GetOrLoadFunc(ctx, pageKey(path, params), func(ctx context.Context) (*Page, error) {
@@ -201,39 +169,25 @@ page, err := c.GetOrLoadFunc(ctx, pageKey(path, params), func(ctx context.Contex
 })
 ```
 
-It is `GetOrLoad` in every other respect, and shares loads with it: callers of one key wait
-for whichever load started first, so the function must return what any other caller's would
-for that key. Views have `GetOrLoadFunc` too. Neither needs a loader in the options.
+It shares loads with `GetOrLoad`: callers of a key wait for whichever load started first,
+so the function must return what any caller's would for that key. Views have it too.
 
 ## Invalidation while loading
 
-`Delete` invalidates outstanding loads for the key, even when it returns `false` because
-there was no stored entry. `Clear` invalidates outstanding loads as it clears each shard.
-Successful `Set`, `SetTTL`, `SetNegative` and `SetNegativeTTL` calls also prevent older
-loads from overwriting their result. Rejected writes leave outstanding loads unchanged.
+`Delete` (even of an absent key), `Clear` and successful writes keep outstanding loads of
+the key from putting their result in the cache. So if a loader reads an old record and the
+application then updates the source and calls `Delete`, the old record does not come back.
+Callers already waiting still get the loader's result; new callers start a new load. Update
+the source before invalidating the cache.
 
-For example, if a loader reads an old record, and the application updates the source and
-then calls `Delete`, that loader cannot put the old record back into the cache. Callers
-already waiting for it still receive its result; invalidation neither cancels those
-requests nor retries them. A new caller after invalidation does not join the obsolete load.
-This is a cache-publication guarantee, not a guarantee that every running request sees
-fresh data. Update the source before invalidating the cache.
-
-The guarantee follows the storage key: it applies across views sharing a namespace and
-to writes or deletes made through the parent cache. Successful loader publications also
-supersede other outstanding loads for the same storage key. Invalidation tracking exists
-only for active loads; deleted keys do not leave permanent metadata behind.
-
-`Clear` visits shards individually, so it is not an atomic snapshot or a pause on traffic.
-New loads and writes may repopulate a shard after it has been cleared. `Close` still only
-stops maintenance goroutines; it does not invalidate entries or cancel loaders.
+This follows the storage key, across views sharing a namespace and the parent cache, and a
+load's own publication supersedes other loads of the key. `Clear` works shard by shard, so
+it is not an atomic snapshot. `Close` only stops background goroutines.
 
 ## Loading many keys at once
 
-When the upstream answers many keys in one call — a query with `IN`, a pipelined round
-trip — loading them one `GetOrLoad` at a time turns one request into as many upstream
-calls as there are keys. `GetManyOrLoad` looks every key up and sends the ones the cache
-does not hold to a `BatchLoader` in one call:
+`GetManyOrLoad` sends the keys the cache does not hold to a `BatchLoader` in one call — a
+query with `IN`, a pipelined round trip:
 
 ```go
 c := sanecache.New(sanecache.Options[int, *Article]{
@@ -247,43 +201,20 @@ c := sanecache.New(sanecache.Options[int, *Article]{
 articles, err := c.GetManyOrLoad(ctx, ids) // cached or loaded; absent ids are not in it
 ```
 
-It keeps the guarantees of `GetOrLoad`, key by key rather than batch by batch:
+Everything works per key: a key another call is already loading is waited for, not loaded
+again, and a `Delete` of one key keeps only that key's result out. A key missing from the
+answer is cached as a negative entry and is simply absent from the result. An error fails
+the whole batch and nothing from it is cached. The upstream call is cancelled only once no
+caller waits for any of its keys.
 
-**Single flight covers each key.** A key that another `GetOrLoad` or `GetManyOrLoad` is
-already loading is waited for, not loaded again, so overlapping batches send the upstream
-only the keys nobody has asked for yet. A `GetOrLoad` for a key that is part of a running
-batch waits for the batch.
-
-**"Does not exist" is a key missing from the answer.** It is cached as a negative entry,
-as `ErrNotFound` from a `Loader` would be, and it is not an error: the key is simply absent
-from the result.
-
-**A failed batch fails whole.** An error from the loader is returned for every key it was
-asked for and nothing from that call is cached, including whatever the map held alongside
-the error. Keys that were already cached, or that other loads supplied, are still returned
-with it.
-
-**The upstream call lives as long as somebody wants any of it.** Its context is cancelled
-once no caller is waiting for any of its keys, so a caller who gives up on part of a batch
-does not cancel it for another caller who needs a different part.
-
-**Invalidation is per key.** A `Delete` or a successful write of one key during the batch
-keeps that key's result out of the cache and leaves the rest of the batch alone.
-
-With only a `BatchLoader`, `GetOrLoad` uses it with a batch of one, so a cache needs a
-single loader for both. With only a `Loader`, `GetManyOrLoad` loads the missing keys
-concurrently, one call each. `Stats().Batches` counts `BatchLoader` calls; against
-`Loads`, which counts keys, it says how many keys an upstream call carries. Batch loading
-is not available on views yet.
+With only a `BatchLoader`, `GetOrLoad` uses it with a batch of one; with only a `Loader`,
+`GetManyOrLoad` loads the missing keys concurrently. `Stats().Batches` counts batch calls.
+Views have no batch loading yet.
 
 ## Refreshing before expiry
 
-A TTL is a promise about staleness, and a cache keeps it by going back to the upstream. On
-a key in steady use it does that on the request path: the value expires, the next caller
-misses and waits, and every key the service relies on goes cold once per TTL. In a busy
-cache with a high hit rate, almost every miss can be exactly that — `Expirations` and
-`Loads` moving in step is the sign of it.
-
+On a key in steady use, a TTL means the value expires, the next caller misses and waits, and
+every hot key goes cold once per TTL. `Expirations` and `Loads` moving in step is the sign.
 `RefreshAfter` moves that load off the request path:
 
 ```go
@@ -294,38 +225,21 @@ c := sanecache.New(sanecache.Options[int, *Rule]{
 })
 ```
 
-A read that finds a value older than `RefreshAfter` returns it at once and starts a load
-in the background. The value in the cache is replaced when the load succeeds, and the TTL
-starts over. A key nobody reads is not refreshed: it expires as it did before, so refresh
-spends upstream calls only on keys that are still wanted.
+A read that finds a value older than `RefreshAfter` returns it at once and starts one load
+in the background; a key nobody reads simply expires. The refresh is an ordinary load to
+single flight and invalidation. The TTL still holds: a failed refresh is not retried, the
+value lives out its TTL, and the next caller then sees the error, so a dead upstream shows
+up one TTL later than without refresh, never more.
 
-**One refresh per value.** However many reads see a value due, it gets one load. The
-refresh takes part in single flight like any load: a caller that finds the key expired
-before the refresh finishes waits for it instead of starting another, and a `Delete` or a
-successful write keeps its result out.
-
-**The TTL still holds.** A failed refresh leaves the value in place until its TTL runs out,
-and is not retried; after that the next caller loads the key and sees the error, as it
-would without refresh. An upstream that is down therefore shows up one TTL later than it
-otherwise would, and never later than that. A refresh answered with `ErrNotFound` turns the
-value into a negative entry when `NegativeTTL` is set.
-
-**Any read with a loader refreshes.** `GetOrLoad` and `GetManyOrLoad` use the loaders in
-`Options`, `GetOrLoadFunc` the function it was given, and `Get` and `Lookup` the loaders in
-`Options` when there are any. `GetManyOrLoad` sends the keys it finds due to the
-`BatchLoader` in one call of their own, apart from the keys it is waiting for. Views take a
-`RefreshAfter` of their own and refresh with their own loaders.
-
-Jitter moves the refresh along with the expiry it belongs to. `Stats().Refreshes` counts
-finished refreshes and `RefreshErrors` the failed ones; neither is part of `Loads`, which
-stays what misses cost.
+`GetOrLoad`, `GetManyOrLoad` and `GetOrLoadFunc` refresh with their loaders, `Get` and
+`Lookup` with the ones in `Options`. `GetManyOrLoad` refreshes due keys in a batch of their
+own. Views take their own `RefreshAfter`. `Stats().Refreshes` and `RefreshErrors` count
+refreshes, apart from `Loads`.
 
 ## Several value types under one budget
 
-A budget in bytes is only worth having if it covers everything competing for the memory.
-One cache per type means one budget per type, and dividing a fixed amount of memory between
-types up front is exactly the guess the byte budget was meant to avoid: the split that was
-right at deploy time is wrong by the next traffic pattern.
+One cache per type means one budget per type, and splitting memory between types up front
+is the guess a byte budget was meant to avoid.
 
 ```go
 c := sanecache.New(sanecache.Options[string, any]{
@@ -347,22 +261,12 @@ seasons := sanecache.NewView(c, sanecache.ViewOptions[*Season]{
 a, ok := articles.Get(id) // a is a *Article, not an any
 ```
 
-A view fixes one value type, counts its own hits and misses, and prefixes its keys with its
-name, so two views cannot collide on the same id. It can bring its own `Cost` — which is
-what spares you the type switch that a shared `Cost func(any) int64` otherwise becomes — and
-its own TTLs. Eviction stays global: a view that suddenly needs more memory takes it from
-whichever entries were used least recently, whatever type they are.
+A view fixes one value type, prefixes its keys with its name and can bring its own `Cost`
+and TTLs. Eviction stays global. Reads cost about 6 ns more than the cache underneath, and
+allocate once name and key exceed 32 bytes. `Stats().TypeMisses` counts lookups that found
+another type under a view's key: a bug detector for two views sharing a name.
 
-A view is a function rather than a method on `Cache` because a method cannot introduce a
-type parameter of its own. Reads cost about 6 ns more than the cache underneath, and no
-allocation while the name and key together stay within 32 bytes: up to that length the
-compiler keeps the joined key on the stack, and past it every read allocates.
-
-`Stats().TypeMisses` counts lookups that found some other type under a view's key. With
-names in the keys that should never happen, which is the point: it is a bug detector for
-two views sharing a name, or a write made straight to the underlying cache.
-
-Views can load values too:
+Views load too:
 
 ```go
 articles := sanecache.NewView(c, sanecache.ViewOptions[*Article]{
@@ -374,24 +278,14 @@ articles := sanecache.NewView(c, sanecache.ViewOptions[*Article]{
 a, err := articles.GetOrLoad(ctx, id)
 ```
 
-The loader receives the original key, without the namespace prefix. Results use the
-view's cost and TTLs within the shared budget. Errors, cancellation, oversized values
-and panics follow the same rules as `Cache.GetOrLoad` above; a wrong-type entry triggers
-a typed load. With no view loader, `GetOrLoad` returns `ErrNoLoader` even for a cached key.
-
-Reuse the same `View` instance to share in-flight loads. Separate instances have
-independent loaders and flights, including instances with the same name; their stored
-entries still share that namespace. The underlying cache's loader is independent and is
-never used as a fallback. `View.Stats()` includes `Loads`, `LoadNotFound`, `LoadErrors` and `Coalesced`;
-the parent cache includes those events in its aggregate counters too.
-
-Counters belong to the view's name, not to the instance: views opened with the same name on
-the same cache share one set, as they share one set of keys.
+The loader gets the key without the prefix and follows the rules of `Cache.GetOrLoad`.
+Loads are shared within one `View` instance; the cache's own loader is never a fallback.
+Counters belong to the view's name and are included in the cache's.
 
 ### Switching caching off
 
-A view opened on a nil cache stores nothing. It is for the configuration where a TTL of
-zero means "do not cache", so that the code calling `GetOrLoad` stays the same either way:
+A view opened on a nil cache stores nothing, so that code calling `GetOrLoad` stays the same
+when a TTL of zero means "do not cache":
 
 ```go
 var cache *sanecache.Cache[string, any]
@@ -405,19 +299,13 @@ articles := sanecache.NewView(cache, sanecache.ViewOptions[*Article]{
 })
 ```
 
-Such a view runs the loader on every call. Callers who arrive while a load is running still
-share it — turning the cache off should not turn off the protection of the upstream — but
-the result, `ErrNotFound` included, is not kept. Lookups are misses, `Delete` reports
-`false`, and writes return `ErrDisabled` rather than a success the next read would
-contradict. Its counters are its own and do not appear in any cache's `ViewStats`.
+It runs the loader on every call, still shared by concurrent callers, and keeps nothing.
+Writes return `ErrDisabled`. Its counters are its own.
 
 ## The `Cost` function is the part worth getting right
 
-`MaxBytes` is only as honest as `Cost`. The number you want is resident size, and it is
-usually several times the serialized size — a decoded struct carries headers, pointers,
-map overhead and per-field padding that JSON does not.
-
-Measure it once instead of guessing:
+`MaxBytes` is only as honest as `Cost`, and resident size is usually several times the
+serialized size. Measure it once:
 
 ```go
 runtime.GC()
@@ -437,19 +325,14 @@ runtime.KeepAlive(values)
 ratio := float64(after.HeapAlloc-before.HeapAlloc) / float64(n*len(sample))
 ```
 
-In one production service this ratio came out at ~2.6× for decoded JSON structs, higher
-for `map[string]any`, and ~6.7× for compiled templates. Sizing a cache off raw payload
-length understated real memory sevenfold.
+In one production service this came out at ~2.6× for decoded JSON structs, higher for
+`map[string]any`, and ~6.7× for compiled templates.
 
 ## Sharding
 
-`Shards` splits the cache into independently locked parts (rounded up to a power of two).
-It is off by default, because it is not free: each shard gets an equal slice of `MaxBytes`,
-so an uneven key distribution leaves part of the budget unused, and eviction becomes
-per-shard rather than global.
-
-Whether it is worth it depends entirely on contention. On an M3 with GOMAXPROCS=8, 4096
-keys, all readers hitting one cache:
+`Shards` splits the cache into independently locked parts, rounded up to a power of two.
+It is off by default: each shard gets an equal slice of the budget, and eviction becomes
+per shard. On an M3 with GOMAXPROCS=8, 4096 keys, all readers on one cache:
 
 | shards | `Get` (LRU) | `Get` (ClearOnFull) | `Set` | 90/10 mixed |
 |-------:|------------:|--------------------:|------:|------------:|
@@ -458,29 +341,19 @@ keys, all readers hitting one cache:
 | 16     | 40 ns       | 24 ns               | 76 ns | 47 ns       |
 | 64     | 33 ns       | 19 ns               | 65 ns | 39 ns       |
 
-Sharding is worth about 4x here and is still buying something at 64. If your service does
-one lookup per request, none of this matters and `Shards: 0` is the right answer.
+At one lookup per request none of this matters, and `Shards: 0` is the right answer.
 
 ## Eviction policies
 
-`LRU` (default) evicts least-recently-used entries until the shard fits. Maintaining that
-order means every read takes a write lock.
-
-`ClearOnFull` drops the whole shard except the entry that just overflowed it. Reads then
-need only a read lock, which is worth 20% on a single shard and 40% once the cache is
-sharded — a read lock only pays off when the cores taking it are not all queued behind the
-same one. This is the right trade when access order is flat (everything in the working set
-is used every cycle, so LRU has no information to offer) and refilling is cheap relative to
-the bookkeeping. It costs hit rate, though: see the table further down.
+`LRU`, the default, evicts least recently used entries, so every read takes a write lock.
+`ClearOnFull` drops the whole shard except the entry that overflowed it; reads then take a
+read lock, worth 20% on one shard and 40% sharded. It suits flat access orders where
+refilling is cheap, and costs hit rate: see the table below.
 
 ## The clock
 
-Uncontended, a `Get` that hits costs 47 ns on the machine above, and **27 ns of that is
-reading the wall clock** to decide whether the entry has expired. Well over half of a
-lookup is `time.Now()`.
-
-`ClockGranularity` hands that job to a background goroutine and lets lookups read an atomic
-instead:
+An uncontended hit costs 47 ns, and 27 ns of that is `time.Now()`. `ClockGranularity` has a
+background goroutine read the clock instead:
 
 ```go
 sanecache.Options[string, *Article]{
@@ -489,56 +362,42 @@ sanecache.Options[string, *Article]{
 }
 ```
 
-A hit then costs 20 ns rather than 47, and expiry becomes accurate to within one interval
-in either direction — which against a ten-minute TTL is nothing, and against a one-second
-TTL is a lot. It is off by default because a TTL that quietly means something other than
-what it says is exactly the kind of surprise this library is about. `Close` stops the
-goroutine and lookups go back to the wall clock, rather than to a clock that has stopped.
+A hit then costs 20 ns, and expiry is accurate to one interval either way: nothing against
+ten minutes, a lot against one second, which is why it is off by default. After `Close`,
+lookups go back to the wall clock.
 
 ## Stats
 
-Counters are built in — no callback interface on the hot path. Poll `Stats()` on your
-metrics interval and export it however you like:
+Counters are built in. Poll `Stats()`, and `ViewStats()` for every view by name:
 
 ```go
 s := c.Stats()
 // s.Hits, s.Misses, s.Negatives, s.TypeMisses, s.Evictions, s.Expirations,
 // s.Replacements, s.Rejections, s.Loads, s.LoadNotFound, s.LoadErrors, s.Coalesced, s.Batches,
 // s.Refreshes, s.RefreshErrors, s.Entries, s.Bytes, s.HitRate()
-```
 
-`ViewStats()` returns the same kind of snapshot for every view opened on the cache, keyed
-by view name, so an exporter needs no list of views of its own:
-
-```go
 for name, vs := range c.ViewStats() {
     // vs.Hits, vs.Misses, vs.Negatives, vs.TypeMisses, vs.Loads, vs.LoadNotFound,
     // vs.LoadErrors, vs.Coalesced, vs.Refreshes, vs.RefreshErrors, vs.HitRate()
 }
 ```
 
-`Rejections` is the one to alert on: a steady nonzero rate means keys that can never be
-cached. `Coalesced` against `Loads` says how much work the single-flight is actually saving
-— if they are equal, the cache is cold in a way worth looking at. `LoadErrors` counts loads
-that failed; a loader answering `ErrNotFound` did not fail, and is counted in `LoadNotFound`
-instead, so an error rate built on `LoadErrors` is not inflated by ids that are simply gone.
-`OnEvict` is available separately when entries hold resources that need releasing.
+Alert on `Rejections`: keys that can never be cached. `Coalesced` against `Loads` is what
+single flight saves. `LoadErrors` leaves out `ErrNotFound`, which is in `LoadNotFound`, so
+ids that are gone do not look like failures.
 
 ## Lifecycle
 
-A background goroutine sweeps expired entries so they stop occupying budget before anyone
-looks them up. `Close()` stops it, along with the clock goroutine if there is one.
-Forgetting to call `Close()` does not leak them — dropping the cache stops them too — but
-calling it is still better than relying on when the collector gets around to it.
-
-`DisableCleanup: true` runs without the sweeper; entries then expire only on lookup.
+A background goroutine sweeps expired entries off the budget. `Close()` stops it and the
+clock goroutine; dropping the cache stops them too. With `DisableCleanup: true` entries
+expire only on lookup.
 
 ## How it compares
 
-The `benchmarks/` module measures this cache against the ones it would otherwise be
-replacing. It is a separate module so the root stays dependency-free; `make bench-compare`
-runs it. Same machine as above, Go 1.24, 256-byte values, a budget sized to 4096 of them,
-medians of five runs. The sanecache rows are its knobs, each one added to the row above it.
+The `benchmarks/` module, separate so the root stays dependency-free, measures this cache
+against the ones it would replace: `make bench-compare`. Same machine, Go 1.24, 256-byte
+values, a budget of 4096 of them, medians of five runs. Each sanecache row adds a knob to the
+row above.
 
 | ns/op | serial `Get` | `Get` ×8 | `Set` ×8 | 90/10 ×8 |
 |---|---:|---:|---:|---:|
@@ -553,26 +412,15 @@ medians of five runs. The sanecache rows are its knobs, each one added to the ro
 | [golang-lru](https://github.com/hashicorp/golang-lru) `v2/expirable` | 54 | 140 | 185 | 168 |
 | [ttlcache](https://github.com/jellydator/ttlcache) v3 | 63 | 175 | 264 | 193 |
 
-The first column is what one lookup costs; the second is what eight goroutines get out of
-the same machine. Read them together, because they say opposite things. Per operation this
-cache is *cheaper* than otter, theine and ristretto — they spend their time maintaining a
-frequency sketch and a set of ring buffers that only pay off later. What they buy with it is
-scaling: otter and theine turn eight cores into 6x to 7x the throughput, this one into 1.6x,
-and unsharded into less than 1x, because reads take a lock and locks are where cores queue.
+Per lookup this cache is *cheaper* than otter, theine and ristretto, which maintain a
+frequency sketch and ring buffers. What those buy is scaling: otter and theine turn eight
+cores into 6–7x the throughput, this one into 1.6x, because reads take a lock. At one lookup
+per request, 19 ns against 13 ns is nothing; it matters when a request does thousands of
+lookups. Writes are the other way round, 81–90 ns against 121–268: an admission policy costs
+more than a lock.
 
-So the honest shape of it is not "slower". It is: **the same work per operation, and less
-of the machine used to do it in parallel.** Whether that matters is a question about the
-read rate. At one lookup per request, the gap between 19 ns and 13 ns is six nanoseconds
-against a request budget measured in milliseconds. It starts to matter when one request
-does thousands of lookups, or when the cache more or less is the service.
-
-Writes are the other way round: 81 to 90 ns against 121 to 268. An admission policy has to
-decide whether to accept each write and update its sketch, and that costs more than taking a
-lock does; sturdyc, closest here, has no admission policy either. A write-heavy cache is the
-case where this library is simply faster.
-
-The number that usually matters more than any of those is how much of a fixed budget each
-policy turns into hits. 4096 entries against a key space of 100,000:
+What usually matters more is how much of a fixed budget turns into hits. 4096 entries
+against 100,000 keys:
 
 | %hit | zipf s=1.20 | zipf s=1.01 | zipf + scan |
 |---|---:|---:|---:|
@@ -585,21 +433,14 @@ policy turns into hits. 4096 entries against a key space of 100,000:
 | golang-lru `expirable` | 87.3 | 65.8 | 78.0 |
 | ttlcache v3 | 87.3 | 65.8 | 78.0 |
 
-When the hot set fits, every policy looks the same and the extra machinery buys 1.7 points.
-When it does not, W-TinyLFU is worth 5.5 points of hit rate over LRU — and 5.5 points of
-upstream traffic is worth more than every nanosecond in the table above it. That is the real
-reason to pick otter or theine, and it is a better one than throughput.
-
-The same table prices the cheap read lock: `ClearOnFull` buys its 40% by giving up 7.9
-points of hit rate. It is a trade for caches whose access order is flat, not a free win.
-sturdyc makes a milder version of the same trade: when a shard is full it drops the
-least recently used tenth of it at once, which costs it 4 points against a plain LRU.
+When the hot set fits, policies differ by 1.7 points. When it does not, W-TinyLFU is worth
+5.5 points over LRU, and that much upstream traffic outweighs every nanosecond above: the
+real reason to pick otter or theine. `ClearOnFull` pays 7.9 points for its cheap reads;
+sturdyc, dropping a full shard's oldest tenth at once, pays 4.
 
 ### The features are not the difference either
 
-Loading a cold key once, loading many keys in one call, refreshing ahead of expiry and a
-budget in something other than entries are not unique to this library. As of otter v2.3.0,
-[theine](https://github.com/Yiling-J/theine-go) v0.6.2,
+As of otter v2.3.0, [theine](https://github.com/Yiling-J/theine-go) v0.6.2,
 [sturdyc](https://github.com/viccon/sturdyc) v1.1.6 and ttlcache v3.4.1:
 
 | | one load per key | batch load | refresh ahead | budget by cost | "not found" remembered | value over budget |
@@ -610,42 +451,34 @@ budget in something other than entries are not unique to this library. As of ott
 | sturdyc | `GetOrFetch` | `GetOrFetchBatch` | `WithEarlyRefreshes` | — | `WithMissingRecordStorage` | — |
 | ttlcache v3 | `SuppressedLoader` | — | — | `WithMaxCost` | — | evicts everything, itself last |
 
-They also do things this library does not. otter and theine can save the cache to a file
-and load it back; sturdyc retries failed refreshes, coalesces refreshes from many requests
-into batches and can sit in front of a distributed store. sturdyc can also hold several
-value types in one cache, with typed package-level functions on top, though its capacity is
-a count of entries rather than bytes.
-
-What is left is the combination rather than any single feature: a byte budget that refuses
-what does not fit, missing records charged against that budget, and value types with costs
-of their own [under one budget](#several-value-types-under-one-budget).
+Others do things this one does not: otter and theine save the cache to a file and load it
+back; sturdyc retries failed refreshes, batches refreshes across requests, sits in front of a
+distributed store, and holds several value types under a count of entries. What is left here
+is the combination: a byte budget that refuses what does not fit, missing records charged
+against it, and value types with costs of their own
+[under one budget](#several-value-types-under-one-budget).
 
 ## When to use something else
 
-- You want the best possible hit rate for a given memory budget, and admission policies and
-  access-frequency estimation are worth the complexity → [otter](https://github.com/maypok86/otter).
-  The hit-rate table above is the size of the prize, and it is the biggest number on this page.
-- Your read path is hot enough that how well a cache scales across cores is a real
-  difference → otter or [ristretto](https://github.com/dgraph-io/ristretto); with ristretto,
-  budget for `Wait()` in the tests.
-- You call an upstream API and want refreshes retried, refreshes from many requests
-  coalesced into batches, or a distributed store behind the cache →
-  [sturdyc](https://github.com/viccon/sturdyc).
-- You are caching hundreds of megabytes and GC pressure from millions of live pointers is
-  your actual problem → [bigcache](https://github.com/allegro/bigcache) or
-  [freecache](https://github.com/coocood/freecache), which reduce GC scanning by storing entries
-  in byte buffers with few pointers. These buffers are on the Go heap; reducing pointer
-  scanning is different from allocating memory outside it. See
-  [BigCache's storage design](https://github.com/allegro/bigcache#how-it-works) and
-  [FreeCache's storage design](https://github.com/coocood/freecache#how-it-is-done).
-- You just want a bounded LRU with TTL and nothing else →
+- The best hit rate for a memory budget is worth admission policies and frequency
+  estimation → [otter](https://github.com/maypok86/otter). The hit-rate table above is the
+  size of the prize.
+- How a cache scales across cores is a real difference on your read path → otter or
+  [ristretto](https://github.com/dgraph-io/ristretto); with ristretto, budget for `Wait()`
+  in the tests.
+- You want refreshes retried, refreshes from many requests batched, or a distributed store
+  behind the cache → [sturdyc](https://github.com/viccon/sturdyc).
+- GC pressure from millions of live pointers is your actual problem →
+  [bigcache](https://github.com/allegro/bigcache) or
+  [freecache](https://github.com/coocood/freecache), which store entries in byte buffers
+  with few pointers, still on the Go heap
+  ([BigCache](https://github.com/allegro/bigcache#how-it-works),
+  [FreeCache](https://github.com/coocood/freecache#how-it-is-done)).
+- A bounded LRU with TTL and nothing else →
   [hashicorp/golang-lru](https://github.com/hashicorp/golang-lru)'s `v2/expirable`.
 
 ## Status
 
 v0.7. The API above is what exists and is tested; expect it to move before v1.
-
-Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for what this
-library optimises for before proposing a change.
-
-MIT licensed.
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for what this library
+optimises for. MIT licensed.

@@ -1,15 +1,8 @@
-// Package sanecache is a small in-memory cache that aims to be predictable
-// before it is fast.
-//
-// Writes are synchronous, so a value is readable the moment Set returns. A value
-// that cannot fit is refused with an error instead of being accepted and dropped
-// later. Budgets are expressed in bytes, because a limit on the number of entries
-// says nothing about the memory a process will use when entries are documents
-// rather than integers. "The upstream says this key does not exist" is a first
-// class answer rather than a marker smuggled inside the value type. TTLs can
-// carry jitter, so a batch of keys warmed by one request does not expire in
-// lockstep and stampede the upstream. And a cold key is fetched once rather than
-// once per concurrent caller asking for it.
+// Package sanecache is a small in-memory cache that is predictable before it is
+// fast: writes are synchronous, a value that cannot fit is refused with an error,
+// budgets are in bytes, "does not exist" is a first-class answer, TTLs carry
+// jitter so that keys warmed together do not expire together, and a cold key is
+// loaded once however many callers ask for it.
 package sanecache
 
 import (
@@ -90,135 +83,99 @@ func (r EvictReason) String() string {
 	}
 }
 
-// Options configures a cache. The zero value is a valid, unbounded, never
-// expiring cache; every field below is optional.
+// Options configures a cache. Every field is optional: the zero value is an
+// unbounded cache whose entries never expire.
 type Options[K comparable, V any] struct {
-	// TTL is how long a value stays valid. Zero means entries never expire on
-	// their own, which only makes sense for a cache bounded by MaxBytes or
-	// MaxEntries, or one whose entries all get an explicit TTL via SetTTL.
+	// TTL is how long a value stays valid. Zero means it never expires, which
+	// suits a bounded cache or one written with SetTTL.
 	TTL time.Duration
 
-	// NegativeTTL enables SetNegative and sets how long a cached "does not
-	// exist" answer lives. It is usually much shorter than TTL: an object that
-	// does not exist yet may appear at any moment.
+	// NegativeTTL enables SetNegative and sets how long a "does not exist" answer
+	// lives. Keep it short: a missing object may appear at any moment.
 	NegativeTTL time.Duration
 
-	// Jitter spreads expiry times by up to this percentage in either direction,
-	// so keys written together do not expire together. Must be 0..100.
+	// Jitter spreads expiry by up to this percentage either way, so that keys
+	// written together do not expire together. Must be 0..100.
 	Jitter int
 
-	// RefreshAfter starts reloading a value in the background once it is this
-	// old, so that a key in steady use is replaced before it expires instead of
-	// going cold and making the next caller wait for the upstream. Zero, the
-	// default, turns it off. It must be shorter than TTL: a value is still never
-	// served past its TTL, so the upstream being down shows up as it does
-	// without refresh, one TTL later.
+	// RefreshAfter reloads a value in the background once it is this old, so that
+	// a key in steady use is replaced before it expires instead of making the next
+	// caller wait. Zero turns it off. It must be shorter than TTL, which still
+	// holds: a failed refresh is not retried, and the value lives out its TTL.
 	//
-	// The read that finds a value due returns it at once and starts the load:
+	// The read that finds a value due returns it and starts its one refresh:
 	// GetOrLoad, GetManyOrLoad and GetOrLoadFunc with their loaders, Get and
-	// Lookup with Loader or BatchLoader when either is set. A due value gets one
-	// refresh, whichever read sees it first. If that load fails, the value stays
-	// until its TTL runs out and the caller after that loads it the usual way;
-	// a refresh that reports ErrNotFound replaces the value with a negative
-	// entry when NegativeTTL is set, and leaves it to its TTL otherwise.
-	// GetManyOrLoad refreshes the keys it finds due in one BatchLoader call.
-	//
-	// A refresh is a load like any other: it shares single flight with the key's
-	// other loads, so a caller that finds the key expired before the refresh
-	// finishes waits for it rather than starting another, and a Delete, a Clear
-	// or a successful write keeps its result out. Its context carries the values
-	// of the read that started it and is never cancelled. Jitter moves the
-	// refresh with the expiry it belongs to.
+	// Lookup with Loader or BatchLoader. GetManyOrLoad refreshes the keys it finds
+	// due in one BatchLoader call. A refresh is an ordinary load to single flight
+	// and invalidation; its context carries the values of the read that started
+	// it and is never cancelled. ErrNotFound replaces the value with a negative
+	// entry when NegativeTTL is set.
 	RefreshAfter time.Duration
 
-	// MaxBytes is the total budget in bytes, split evenly across shards. It
-	// requires Cost. Zero means unbounded.
+	// MaxBytes is the budget in bytes, split evenly across shards. It requires
+	// Cost. Zero means unbounded.
 	MaxBytes int64
 
 	// MaxEntries caps the number of entries, split evenly across shards. Zero
 	// means unbounded. Prefer MaxBytes unless entries are uniform in size.
 	MaxEntries int
 
-	// Cost reports the memory a value occupies, in bytes. It is what MaxBytes is
-	// measured against, so it should approximate resident size rather than
-	// serialized size: a decoded struct commonly costs several times its JSON.
-	// Measure it once rather than guessing (see the README).
+	// Cost reports the resident size of a value in bytes, which is what MaxBytes
+	// counts. A decoded struct commonly costs several times its JSON: measure it
+	// rather than guess (see the README).
 	Cost func(V) int64
 
-	// Loader fetches a value that is not cached. It is what GetOrLoad calls, and
-	// callers that ask for the same key while it is running share the one call
-	// instead of each starting their own.
+	// Loader fetches a value that is not cached, for GetOrLoad. Callers who ask
+	// for a key while its load runs share that one call.
 	//
-	// Returning an error that wraps ErrNotFound means the upstream has no such
-	// key: the answer is cached as a negative entry when NegativeTTL is set, and
-	// reported to every waiting caller. Any other error is passed through
-	// unchanged and is not cached.
+	// An error wrapping ErrNotFound means the upstream has no such key, and is
+	// cached as a negative entry when NegativeTTL is set. Other errors are
+	// returned unchanged and not cached.
 	//
-	// The context is not any one caller's: it carries the values of the caller
-	// that started the load, but it is cancelled only once every caller waiting
-	// for the result has given up. A loader must not call GetOrLoad on the same
-	// cache and key, which would wait for itself.
-	//
-	// A load that nobody is waiting for any more is cancelled, but a loader that
-	// does not watch its context finishes regardless, and its value is cached
-	// even so. That is what keeps a cache warming when callers time out faster
-	// than the upstream answers. It cannot put back a stale value: a Delete, a
-	// Clear or a successful write of the key since the load started, including
-	// another load's publication, keeps its result out of the cache.
+	// The context carries the values of the caller that started the load, but is
+	// cancelled only once every waiting caller has given up. A loader that ignores
+	// it still caches its result, unless a Delete, a Clear or a successful write of
+	// the key came after the load started. A loader must not GetOrLoad its own key.
 	Loader func(ctx context.Context, key K) (V, error)
 
-	// BatchLoader fetches several keys that are not cached in one call. It is
-	// what GetManyOrLoad calls with the keys nobody is loading yet, and what
-	// GetOrLoad calls with a single key when Loader is not set, so that a cache
-	// with an upstream answering many keys at once needs only this one loader.
+	// BatchLoader fetches several uncached keys in one call: the keys of
+	// GetManyOrLoad nobody is loading yet, and the key of GetOrLoad when Loader is
+	// not set.
 	//
-	// The result maps each key the upstream has to its value. A requested key
-	// missing from it means the upstream has no such key, the same answer as a
-	// Loader returning ErrNotFound; keys that were not requested are ignored. An
-	// error fails every key of the call, and is neither cached nor combined with
-	// whatever the map holds. The context follows Loader's rules, counting the
-	// waiters of every key in the call: it is cancelled once none of them is
-	// waiting for any key.
+	// A requested key missing from the result does not exist upstream, as if a
+	// Loader had returned ErrNotFound; keys not requested are ignored. An error
+	// fails every key, and nothing from the call is cached. The context is
+	// cancelled once no caller waits for any of its keys.
 	BatchLoader func(ctx context.Context, keys []K) (map[K]V, error)
 
 	// Shards splits the cache into independently locked parts, rounded up to a
-	// power of two. Zero and one both mean a single lock. More shards reduce
-	// contention but make the budget approximate: each shard gets an equal slice
-	// of MaxBytes, and an uneven key distribution leaves some of it unused.
-	//
-	// The per-shard slice is rounded up, so the shards together are never
-	// stricter than what was asked for. With small caps that rounding dominates:
-	// MaxEntries of 2 across 16 shards is one entry per shard, or sixteen in
-	// total. Keep the cap comfortably larger than the shard count.
+	// power of two; zero and one both mean a single lock. Each shard gets an equal
+	// slice of the budget, rounded up, so the budget becomes approximate. Keep it
+	// well above the shard count: MaxEntries of 2 across 16 shards holds 16.
 	Shards int
 
 	// Policy selects the eviction strategy. Defaults to LRU.
 	Policy Policy
 
 	// CleanupInterval is how often a background goroutine drops expired entries.
-	// Zero picks an interval from the configured TTLs. Expired entries are also
-	// dropped lazily on lookup, but until they are swept they still count
-	// against the budget.
+	// Zero picks it from the TTLs. Lookups drop expired entries too, but until
+	// then they count against the budget.
 	CleanupInterval time.Duration
 
-	// DisableCleanup runs the cache without a background goroutine. Expiry then
-	// happens only on lookup and on eviction.
+	// DisableCleanup runs without that goroutine: entries then expire only on
+	// lookup and on eviction.
 	DisableCleanup bool
 
-	// ClockGranularity trades TTL precision for lookup speed. Reading the wall
-	// clock is about half the cost of a lookup, so a cache under enough load for
-	// that to show up can have a background goroutine hold the time instead,
-	// refreshed this often. Expiry is then accurate to within one interval in
-	// either direction. Zero, the default, reads the clock on every operation.
-	//
-	// The goroutine is separate from the sweeper, so this works with
-	// DisableCleanup. Close stops it, and lookups go back to the wall clock.
+	// ClockGranularity has a background goroutine read the clock this often,
+	// instead of every lookup paying for it, which is about half of what a lookup
+	// costs. Expiry is then accurate to one interval either way. Zero reads the
+	// clock every time. It works with DisableCleanup; Close returns lookups to the
+	// wall clock.
 	ClockGranularity time.Duration
 
-	// OnEvict, if set, is called for every entry that leaves the cache without
-	// being explicitly deleted. Negative entries are reported with the zero
-	// value. It runs outside the shard lock, on the goroutine that caused the
-	// removal, so it must not block.
+	// OnEvict is called for every entry that leaves the cache other than by Delete
+	// or Clear, with the zero value for a negative entry. It runs outside the
+	// shard lock on the goroutine that caused the removal, so it must not block.
 	OnEvict func(key K, value V, reason EvictReason)
 
 	// DisableStats skips the counters behind Stats.
@@ -231,9 +188,8 @@ type Cache[K comparable, V any] struct {
 	core *core[K, V]
 }
 
-// core holds everything the background goroutines touch. It is deliberately
-// separate from Cache so that a Cache the caller has dropped can be collected
-// while those goroutines are still shutting down.
+// core holds everything the background goroutines touch, apart from Cache so
+// that a dropped Cache can be collected while they shut down.
 type core[K comparable, V any] struct {
 	shards []*shard[K, V]
 	mask   uint64
@@ -255,23 +211,21 @@ type core[K comparable, V any] struct {
 	// every Get.
 	getRefresher refresher
 
-	// views holds one set of counters per view name. Views with the same name
-	// share a namespace in storage, so they share counters too; the map only
-	// grows with the number of distinct names, which is fixed by the program.
+	// views holds the counters of each view name: views of one name share keys,
+	// so they share counters too.
 	viewsMu sync.Mutex
 	views   map[string]*counters
 
-	// coarse holds the time a background goroutine last read, in unix
-	// nanoseconds, or nil when the cache reads the clock itself. Zero means the
-	// goroutine has stopped and the wall clock is authoritative again.
+	// coarse is the time the clock goroutine last read, in unix nanoseconds; nil
+	// without ClockGranularity, zero once the goroutine has stopped.
 	coarse *atomic.Int64
 
 	stop *stopper
 }
 
 // New builds a cache from o. It panics on options that cannot describe a working
-// cache, such as a byte budget without a Cost function: those are programming
-// mistakes, and failing at construction beats a cache that silently misbehaves.
+// cache, such as a byte budget without Cost: a programming mistake is better
+// caught at construction than by a cache that silently misbehaves.
 func New[K comparable, V any](o Options[K, V]) *Cache[K, V] {
 	switch {
 	case o.Jitter < 0 || o.Jitter > 100:
@@ -375,15 +329,13 @@ func (c *Cache[K, V]) Set(key K, value V) error {
 }
 
 // SetTTL caches value under key for ttl, overriding Options.TTL. A ttl of zero
-// means the entry never expires on its own. Successful writes supersede outstanding
-// loads for the key.
+// means the entry never expires on its own.
 func (c *Cache[K, V]) SetTTL(key K, value V, ttl time.Duration) error {
 	return c.core.setValue(key, value, c.core.valueCost(value), ttl, c.core.refreshAfter, refreshCache)
 }
 
 // SetNegative records that the upstream reports no such key, for the configured
-// NegativeTTL. Without it, a template that names a deleted object hits the
-// upstream on every single render. A successful write supersedes outstanding loads.
+// NegativeTTL. A successful write supersedes outstanding loads.
 func (c *Cache[K, V]) SetNegative(key K) error {
 	return c.core.setNegative(key, c.core.negativeTTL)
 }
@@ -441,17 +393,14 @@ func (c *Cache[K, V]) Close() {
 	}
 }
 
-// entryOverhead is what an entry occupies apart from its value and the bytes of a
-// string key: the entry itself and its share of the shard map. Measured by
-// BenchmarkNegativeEntryMemory at 115-133 bytes for a Cache[string, any],
-// depending on how full the map is, and about 16 less for a value type of one
-// word; a "does not exist" marker is charged this much plus its key.
+// entryOverhead is an entry and its share of the shard map, apart from the value
+// and the bytes of a string key: 115-133 bytes for a Cache[string, any] by
+// BenchmarkNegativeEntryMemory, depending on how full the map is.
 const entryOverhead int64 = 128
 
-// negativeCost is what a "does not exist" marker is charged under a byte budget.
-// It holds no value, but it does hold an entry, a map slot and the key; string
-// keys are usually the ones worth counting, since a view builds a fresh one for
-// every write and the entry keeps it alive.
+// negativeCost is what a "does not exist" marker is charged under a byte budget:
+// no value, but an entry, a map slot and the key, which for a view is a fresh
+// string the entry keeps alive.
 func negativeCost[K comparable](key K) int64 {
 	if s, ok := any(key).(string); ok {
 		return entryOverhead + int64(len(s))
@@ -490,8 +439,7 @@ func (c *core[K, V]) setNegative(key K, ttl time.Duration, tokens ...*loadToken)
 		return ErrNegativeDisabled
 	}
 
-	// A negative entry carries no value, but it is not free either: charging it
-	// nothing would make it un-evictable under a byte budget.
+	// Charged nothing, it would never be evicted by a byte budget.
 	var cost int64
 	if c.cost != nil {
 		cost = negativeCost(key)
@@ -677,11 +625,8 @@ func (c *core[K, V]) clockLoop(granularity time.Duration, stop <-chan struct{}) 
 	for {
 		select {
 		case <-t.C:
-			// The clock is read here rather than taken from the tick. A tick
-			// carries the time it fired, which after a pause or a busy scheduler
-			// can be several intervals old — and publishing that would make
-			// expiry lag by the delay on top of the granularity, which is more
-			// than this option promises.
+			// Not the tick's own time: after a pause it can be intervals old,
+			// and expiry would lag by more than the granularity promises.
 			c.coarse.Store(time.Now().UnixNano())
 		case <-stop:
 			return

@@ -130,9 +130,8 @@ func ExampleCache_GetOrLoad() {
 		Loader: func(_ context.Context, id string) (*article, error) {
 			upstreamCalls.Add(1)
 			if id == "gone" {
-				// The upstream's own "no such row" is translated once, here, so
-				// that callers see the same error whether the answer came from
-				// the upstream or from the negative entry it left behind.
+				// The upstream's "no such row" is translated once, here, and
+				// callers see the same error from the negative entry later.
 				return nil, sanecache.ErrNotFound
 			}
 
