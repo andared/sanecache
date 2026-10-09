@@ -33,6 +33,10 @@ import (
 //
 // Without a BatchLoader the missing keys are loaded concurrently with
 // Options.Loader, one call per key. With neither, it returns ErrNoLoader.
+//
+// With RefreshAfter, the hits due for a refresh are refreshed together in one
+// BatchLoader call of their own, apart from the missing keys: nobody waits for
+// them, so they should not hold up the batch somebody does wait for.
 func (c *Cache[K, V]) GetManyOrLoad(ctx context.Context, keys []K) (map[K]V, error) {
 	cr := c.core
 	if cr.loader == nil {
@@ -43,8 +47,9 @@ func (c *Cache[K, V]) GetManyOrLoad(ctx context.Context, keys []K) (map[K]V, err
 	// duplicates; the set of keys that were not hits is only built once there is
 	// one, so that the common case costs one map rather than two.
 	found := make(map[K]V, len(keys))
-	var missing []K
+	var missing, due []K
 	var notHit map[K]struct{}
+	by := cr.refresherWith(cr.loader)
 	for _, key := range keys {
 		if _, dup := found[key]; dup {
 			continue
@@ -53,7 +58,10 @@ func (c *Cache[K, V]) GetManyOrLoad(ctx context.Context, keys []K) (map[K]V, err
 			continue
 		}
 
-		v, st := c.Lookup(key)
+		v, st, _, refresh := cr.lookup(key, by)
+		if refresh {
+			due = append(due, key)
+		}
 		if st == StatusHit {
 			found[key] = v
 
@@ -67,6 +75,9 @@ func (c *Cache[K, V]) GetManyOrLoad(ctx context.Context, keys []K) (map[K]V, err
 			missing = append(missing, key)
 		}
 	}
+	if len(due) > 0 {
+		cr.refreshMany(ctx, due)
+	}
 	if len(missing) == 0 {
 		return found, nil
 	}
@@ -77,10 +88,10 @@ func (c *Cache[K, V]) GetManyOrLoad(ctx context.Context, keys []K) (map[K]V, err
 	waits, fresh, batch := cr.acquire(ctx, missing, found)
 	switch {
 	case batch != nil:
-		go cr.runBatch(batch.ctx, batch.cancel, fresh)
+		go cr.runBatch(batch.ctx, batch.cancel, fresh, false)
 	default:
 		for _, f := range fresh {
-			go cr.run(f.ctx, f.g, f.s, f.key, f.cl, cr.loader)
+			go cr.run(f.ctx, f.g, f.s, f.key, f.cl, cr.loader, false)
 		}
 	}
 
@@ -147,7 +158,7 @@ func (c *core[K, V]) acquire(ctx context.Context, keys []K, found map[K]V) (wait
 		// The same recheck as load's, for the same reason: without it a caller
 		// descheduled after its lookup would load a value already cached.
 		token := s.beginLoad(key)
-		if v, st, _ := s.get(key, c.now()); st != StatusMiss {
+		if v, st, _, _ := s.get(key, c.now(), refreshNone); st != StatusMiss {
 			s.endLoad(key, token)
 			g.mu.Unlock()
 			c.countCoalesced(s)
@@ -182,9 +193,49 @@ func (c *core[K, V]) acquire(ctx context.Context, keys []K, found map[K]V) (wait
 	return waits, fresh, batch
 }
 
+// refreshMany is refresh for several keys, in one BatchLoader call when there is
+// a batch loader. Keys whose load is already running are left to it.
+func (c *core[K, V]) refreshMany(ctx context.Context, keys []K) {
+	if c.batchLoader == nil {
+		for _, key := range keys {
+			c.refresh(ctx, key, c.loader)
+		}
+
+		return
+	}
+
+	var fresh []flight[K, V]
+	batch := &batchLoad{}
+	batch.ctx, batch.cancel = context.WithCancel(context.WithoutCancel(ctx))
+	for _, key := range keys {
+		idx := c.shardIndex(key)
+		g, s := c.flights[idx], c.shards[idx]
+
+		g.mu.Lock()
+		if cl, ok := g.calls[key]; ok && cl.token.valid.Load() {
+			g.mu.Unlock()
+
+			continue
+		}
+		// One waiter that never leaves, as in refresh.
+		cl := &call[V]{done: make(chan struct{}), waiters: 1, token: s.beginLoad(key), cancel: batch.join()}
+		g.calls[key] = cl
+		g.mu.Unlock()
+
+		fresh = append(fresh, flight[K, V]{key: key, g: g, s: s, cl: cl, ctx: batch.ctx})
+	}
+	if len(fresh) == 0 {
+		batch.cancel()
+
+		return
+	}
+
+	go c.runBatch(batch.ctx, batch.cancel, fresh, true)
+}
+
 // runBatch performs one batch load and publishes each key's result, the way run
-// does for one key.
-func (c *core[K, V]) runBatch(ctx context.Context, cancel context.CancelFunc, fresh []flight[K, V]) {
+// does for one key. refresh says the batch is a refresh.
+func (c *core[K, V]) runBatch(ctx context.Context, cancel context.CancelFunc, fresh []flight[K, V], refresh bool) {
 	defer cancel()
 	defer func() {
 		for _, f := range fresh {
@@ -205,7 +256,7 @@ func (c *core[K, V]) runBatch(ctx context.Context, cancel context.CancelFunc, fr
 		if c.countStats {
 			fresh[0].s.counters.batches.Add(1)
 			for _, f := range fresh {
-				f.s.counters.countLoad(outcomeOf(f.cl.err, f.cl.pan))
+				f.s.counters.countLoad(outcomeOf(f.cl.err, f.cl.pan), refresh)
 			}
 		}
 		for _, f := range fresh {
@@ -232,7 +283,7 @@ func (c *core[K, V]) runBatch(ctx context.Context, cancel context.CancelFunc, fr
 			}
 		case ok:
 			f.cl.val = v
-			_ = c.setValue(f.key, v, c.valueCost(v), c.ttl, f.cl.token)
+			_ = c.setValue(f.key, v, c.valueCost(v), c.ttl, c.refreshAfter, refreshCache, f.cl.token)
 		default:
 			f.cl.err = ErrNotFound
 			_ = c.setNegative(f.key, c.negativeTTL, f.cl.token)

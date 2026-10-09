@@ -48,6 +48,14 @@ type ViewOptions[T any] struct {
 	// takes the cache's NegativeTTL, and if that is unset too, SetNegative on
 	// this view reports ErrNegativeDisabled.
 	NegativeTTL time.Duration
+
+	// RefreshAfter is Options.RefreshAfter for this view's values, refreshed with
+	// this view's loaders: Loader for GetOrLoad, Get and Lookup, the caller's
+	// function for GetOrLoadFunc. It must be shorter than the view's TTL. Unlike
+	// TTL it is not taken from the cache when zero, since the cache's would have
+	// to fit every view's TTL; zero means this view does not refresh, and the
+	// cache's RefreshAfter never touches a view's values.
+	RefreshAfter time.Duration
 }
 
 // View is a typed window onto a cache that holds values of several types under
@@ -65,13 +73,18 @@ type ViewOptions[T any] struct {
 // While the name and key together fit in 32 bytes the compiler keeps that on the
 // stack; past it, every read allocates.
 type View[T any] struct {
-	cache       *Cache[string, any]
-	name        string
-	prefix      string
-	cost        func(T) int64
-	ttl         time.Duration
-	negativeTTL time.Duration
-	countStats  bool
+	cache        *Cache[string, any]
+	name         string
+	prefix       string
+	cost         func(T) int64
+	ttl          time.Duration
+	negativeTTL  time.Duration
+	refreshAfter time.Duration
+	countStats   bool
+
+	// getRefresher is who Get and Lookup read as: refreshView with RefreshAfter
+	// and a Loader, refreshNone otherwise. Worked out once, as the cache does.
+	getRefresher refresher
 
 	loader  func(context.Context, string) (T, error)
 	flights []*flightGroup[string, T]
@@ -97,6 +110,8 @@ func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 		panic(fmt.Sprintf("sanecache: ViewOptions.Name must not contain %q, got %q", viewSeparator, o.Name))
 	case o.TTL < 0 || o.NegativeTTL < 0:
 		panic("sanecache: ViewOptions TTL and NegativeTTL must not be negative")
+	case o.RefreshAfter < 0:
+		panic("sanecache: ViewOptions.RefreshAfter must not be negative")
 	}
 
 	if c == nil {
@@ -129,6 +144,12 @@ func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 	if v.negativeTTL == 0 {
 		v.negativeTTL = c.core.negativeTTL
 	}
+	if o.RefreshAfter > 0 && (v.ttl == 0 || o.RefreshAfter >= v.ttl) {
+		panic(fmt.Sprintf("sanecache: ViewOptions.RefreshAfter must be shorter than the view's TTL, got %v with TTL %v",
+			o.RefreshAfter, v.ttl))
+	}
+	v.refreshAfter = o.RefreshAfter
+	v.getRefresher = v.refresherWith(o.Loader)
 
 	// Made with or without a view loader: GetOrLoadFunc brings its own.
 	v.flights = make([]*flightGroup[string, T], len(c.core.shards))
@@ -153,8 +174,22 @@ func (v *View[T]) Get(key string) (T, bool) {
 
 // Lookup returns the cached value and how the view answered. An entry holding
 // some other type is reported as a miss and counted as a TypeMiss: the value is
-// unusable here, so the caller has to go to the upstream either way.
+// unusable here, so the caller has to go to the upstream either way. With
+// RefreshAfter and a Loader, a value due for a refresh starts one.
 func (v *View[T]) Lookup(key string) (T, Status) {
+	// background rather than context.Background(): the call is what would keep
+	// this from inlining into Get, and that costs every view read a call.
+	return v.lookup(background, key, v.getRefresher, v.loader)
+}
+
+// background is the context of the refreshes Get and Lookup start, which have no
+// caller's context to carry.
+var background = context.Background()
+
+// lookup is Lookup as reader by, refreshing with loader.
+func (v *View[T]) lookup(
+	ctx context.Context, key string, by refresher, loader func(context.Context, string) (T, error),
+) (T, Status) {
 	var zero T
 
 	if v.cache == nil {
@@ -163,7 +198,7 @@ func (v *View[T]) Lookup(key string) (T, Status) {
 		return zero, StatusMiss
 	}
 
-	raw, st, shard := v.cache.core.lookup(v.prefix + key)
+	raw, st, shard, refresh := v.cache.core.lookup(v.prefix+key, by)
 	switch st {
 	case StatusHit:
 		val, ok := raw.(T)
@@ -174,6 +209,9 @@ func (v *View[T]) Lookup(key string) (T, Status) {
 			return zero, StatusMiss
 		}
 		v.count(&v.stats.hits)
+		if refresh {
+			v.refresh(ctx, key, loader)
+		}
 
 		return val, StatusHit
 
@@ -201,7 +239,7 @@ func (v *View[T]) SetTTL(key string, value T, ttl time.Duration) error {
 		return ErrDisabled
 	}
 
-	return v.cache.core.setValue(v.prefix+key, value, v.valueCost(value), ttl)
+	return v.cache.core.setValue(v.prefix+key, value, v.valueCost(value), ttl, v.refreshAfter, refreshView)
 }
 
 // SetNegative records that the upstream reports no such key, for the view's
@@ -269,6 +307,15 @@ func (c *core[K, V]) viewCounters(name string) *viewCounters {
 	return counters
 }
 
+// refresherWith is who a read of this view is when it would refresh with loader.
+func (v *View[T]) refresherWith(loader func(context.Context, string) (T, error)) refresher {
+	if v.refreshAfter > 0 && loader != nil {
+		return refreshView
+	}
+
+	return refreshNone
+}
+
 func (v *View[T]) valueCost(value T) int64 {
 	if v.cost != nil {
 		return v.cost(value)
@@ -283,7 +330,16 @@ func (v *View[T]) count(c *atomic.Int64) {
 	}
 }
 
-func (v *View[T]) countLoad(o loadOutcome) {
+func (v *View[T]) countLoad(o loadOutcome, refresh bool) {
+	if refresh {
+		v.count(&v.stats.refreshes)
+		if o == loadFailed {
+			v.count(&v.stats.refreshErrors)
+		}
+
+		return
+	}
+
 	v.count(&v.stats.loads)
 	switch o {
 	case loadNotFound:
@@ -310,6 +366,9 @@ type ViewStats struct {
 	LoadNotFound int64 // completed loader calls that returned ErrNotFound
 	LoadErrors   int64 // completed loader calls that failed otherwise, or panicked
 	Coalesced    int64 // calls spared a load by another caller
+
+	Refreshes     int64 // completed refreshes started by RefreshAfter
+	RefreshErrors int64 // refreshes that failed or panicked
 }
 
 // HitRate reports hits as a fraction of all lookups, counting a cached negative
@@ -324,25 +383,29 @@ func (s ViewStats) HitRate() float64 {
 }
 
 type viewCounters struct {
-	hits         atomic.Int64
-	misses       atomic.Int64
-	negatives    atomic.Int64
-	typeMisses   atomic.Int64
-	loads        atomic.Int64
-	loadNotFound atomic.Int64
-	loadErrors   atomic.Int64
-	coalesced    atomic.Int64
+	hits          atomic.Int64
+	misses        atomic.Int64
+	negatives     atomic.Int64
+	typeMisses    atomic.Int64
+	loads         atomic.Int64
+	loadNotFound  atomic.Int64
+	loadErrors    atomic.Int64
+	coalesced     atomic.Int64
+	refreshes     atomic.Int64
+	refreshErrors atomic.Int64
 }
 
 func (c *viewCounters) snapshot() ViewStats {
 	return ViewStats{
-		Hits:         c.hits.Load(),
-		Misses:       c.misses.Load(),
-		Negatives:    c.negatives.Load(),
-		TypeMisses:   c.typeMisses.Load(),
-		Loads:        c.loads.Load(),
-		LoadNotFound: c.loadNotFound.Load(),
-		LoadErrors:   c.loadErrors.Load(),
-		Coalesced:    c.coalesced.Load(),
+		Hits:          c.hits.Load(),
+		Misses:        c.misses.Load(),
+		Negatives:     c.negatives.Load(),
+		TypeMisses:    c.typeMisses.Load(),
+		Loads:         c.loads.Load(),
+		LoadNotFound:  c.loadNotFound.Load(),
+		LoadErrors:    c.loadErrors.Load(),
+		Coalesced:     c.coalesced.Load(),
+		Refreshes:     c.refreshes.Load(),
+		RefreshErrors: c.refreshErrors.Load(),
 	}
 }

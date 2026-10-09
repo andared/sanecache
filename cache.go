@@ -107,6 +107,30 @@ type Options[K comparable, V any] struct {
 	// so keys written together do not expire together. Must be 0..100.
 	Jitter int
 
+	// RefreshAfter starts reloading a value in the background once it is this
+	// old, so that a key in steady use is replaced before it expires instead of
+	// going cold and making the next caller wait for the upstream. Zero, the
+	// default, turns it off. It must be shorter than TTL: a value is still never
+	// served past its TTL, so the upstream being down shows up as it does
+	// without refresh, one TTL later.
+	//
+	// The read that finds a value due returns it at once and starts the load:
+	// GetOrLoad, GetManyOrLoad and GetOrLoadFunc with their loaders, Get and
+	// Lookup with Loader or BatchLoader when either is set. A due value gets one
+	// refresh, whichever read sees it first. If that load fails, the value stays
+	// until its TTL runs out and the caller after that loads it the usual way;
+	// a refresh that reports ErrNotFound replaces the value with a negative
+	// entry when NegativeTTL is set, and leaves it to its TTL otherwise.
+	// GetManyOrLoad refreshes the keys it finds due in one BatchLoader call.
+	//
+	// A refresh is a load like any other: it shares single flight with the key's
+	// other loads, so a caller that finds the key expired before the refresh
+	// finishes waits for it rather than starting another, and a Delete, a Clear
+	// or a successful write keeps its result out. Its context carries the values
+	// of the read that started it and is never cancelled. Jitter moves the
+	// refresh with the expiry it belongs to.
+	RefreshAfter time.Duration
+
 	// MaxBytes is the total budget in bytes, split evenly across shards. It
 	// requires Cost. Zero means unbounded.
 	MaxBytes int64
@@ -215,16 +239,21 @@ type core[K comparable, V any] struct {
 	mask   uint64
 	seed   maphash.Seed
 
-	ttl         time.Duration
-	negativeTTL time.Duration
-	jitter      int64
-	cost        func(V) int64
-	onEvict     func(K, V, EvictReason)
-	countStats  bool
+	ttl          time.Duration
+	negativeTTL  time.Duration
+	refreshAfter time.Duration
+	jitter       int64
+	cost         func(V) int64
+	onEvict      func(K, V, EvictReason)
+	countStats   bool
 
 	loader      func(context.Context, K) (V, error)
 	batchLoader func(context.Context, []K) (map[K]V, error)
 	flights     []*flightGroup[K, V]
+
+	// getRefresher is refresherWith(loader), worked out once: it is asked on
+	// every Get.
+	getRefresher refresher
 
 	// views holds one set of counters per view name. Views with the same name
 	// share a namespace in storage, so they share counters too; the map only
@@ -257,25 +286,31 @@ func New[K comparable, V any](o Options[K, V]) *Cache[K, V] {
 		panic("sanecache: TTL and NegativeTTL must not be negative")
 	case o.ClockGranularity < 0:
 		panic("sanecache: ClockGranularity must not be negative")
+	case o.RefreshAfter < 0:
+		panic("sanecache: RefreshAfter must not be negative")
+	case o.RefreshAfter > 0 && (o.TTL == 0 || o.RefreshAfter >= o.TTL):
+		panic(fmt.Sprintf("sanecache: RefreshAfter must be shorter than TTL, got %v with TTL %v", o.RefreshAfter, o.TTL))
 	}
 
 	n := shardCount(o.Shards)
 	cr := &core[K, V]{
-		shards:      make([]*shard[K, V], n),
-		mask:        uint64(n - 1),
-		seed:        maphash.MakeSeed(),
-		ttl:         o.TTL,
-		negativeTTL: o.NegativeTTL,
-		jitter:      int64(o.Jitter),
-		cost:        o.Cost,
-		onEvict:     o.OnEvict,
-		countStats:  !o.DisableStats,
-		loader:      o.Loader,
-		batchLoader: o.BatchLoader,
+		shards:       make([]*shard[K, V], n),
+		mask:         uint64(n - 1),
+		seed:         maphash.MakeSeed(),
+		ttl:          o.TTL,
+		negativeTTL:  o.NegativeTTL,
+		refreshAfter: o.RefreshAfter,
+		jitter:       int64(o.Jitter),
+		cost:         o.Cost,
+		onEvict:      o.OnEvict,
+		countStats:   !o.DisableStats,
+		loader:       o.Loader,
+		batchLoader:  o.BatchLoader,
 	}
 	if cr.loader == nil && cr.batchLoader != nil {
 		cr.loader = cr.loadAsBatch
 	}
+	cr.getRefresher = cr.refresherWith(cr.loader)
 
 	perBytes := divideBudget(o.MaxBytes, int64(n))
 	perEntries := int(divideBudget(int64(o.MaxEntries), int64(n)))
@@ -323,9 +358,12 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 	return v, st == StatusHit
 }
 
-// Lookup returns the cached value and how the cache answered.
+// Lookup returns the cached value and how the cache answered. With
+// RefreshAfter and a loader in Options, a value due for a refresh starts one.
 func (c *Cache[K, V]) Lookup(key K) (V, Status) {
-	v, st, _ := c.core.lookup(key)
+	// One call, so that Get and Lookup still inline into their callers:
+	// starting the refresh here would make this too big for that.
+	v, st := c.core.read(key)
 
 	return v, st
 }
@@ -340,7 +378,7 @@ func (c *Cache[K, V]) Set(key K, value V) error {
 // means the entry never expires on its own. Successful writes supersede outstanding
 // loads for the key.
 func (c *Cache[K, V]) SetTTL(key K, value V, ttl time.Duration) error {
-	return c.core.setValue(key, value, c.core.valueCost(value), ttl)
+	return c.core.setValue(key, value, c.core.valueCost(value), ttl, c.core.refreshAfter, refreshCache)
 }
 
 // SetNegative records that the upstream reports no such key, for the configured
@@ -446,13 +484,21 @@ func (c *core[K, V]) valueCost(v V) int64 {
 	return c.cost(v)
 }
 
-func (c *core[K, V]) setValue(key K, value V, cost int64, ttl time.Duration, tokens ...*loadToken) error {
-	return c.store(&entry[K, V]{
-		key:       key,
-		value:     value,
-		cost:      cost,
-		expiresAt: c.expiryAt(ttl),
-	}, tokens...)
+// setValue stores a value that expires after ttl. Once it is refreshAfter old, a
+// read by owner may refresh it; zero, or anything not shorter than ttl, means
+// never.
+func (c *core[K, V]) setValue(
+	key K, value V, cost int64, ttl, refreshAfter time.Duration, owner refresher, tokens ...*loadToken,
+) error {
+	e := &entry[K, V]{key: key, value: value, cost: cost, byView: owner == refreshView}
+	var refreshAt int64
+	e.expiresAt, refreshAt = c.deadlines(ttl, refreshAfter)
+	// A fresh entry already holds zero, and an atomic store is not free.
+	if refreshAt != 0 {
+		e.refreshAt.Store(refreshAt)
+	}
+
+	return c.store(e, tokens...)
 }
 
 func (c *core[K, V]) setNegative(key K, ttl time.Duration, tokens ...*loadToken) error {
@@ -503,27 +549,56 @@ func (c *core[K, V]) store(e *entry[K, V], tokens ...*loadToken) error {
 	return nil
 }
 
-// lookup is Cache.Lookup with the shard it landed on, which a view needs in
-// order to count a type miss where the rest of that key's counters live.
-func (c *core[K, V]) lookup(key K) (V, Status, *shard[K, V]) {
+// lookup is a read with the shard it landed on, which a view needs in order to
+// count a type miss where the rest of that key's counters live, and with whether
+// the read, being by, claimed a refresh it now has to start.
+func (c *core[K, V]) lookup(key K, by refresher) (V, Status, *shard[K, V], bool) {
 	s := c.shardFor(key)
-	v, st, wasExpired := s.get(key, c.now())
+	v, st, wasExpired, refresh := s.get(key, c.now(), by)
+	c.countLookup(s, st, wasExpired)
 
-	if c.countStats {
-		switch st {
-		case StatusHit:
-			s.counters.hits.Add(1)
-		case StatusNegative:
-			s.counters.negatives.Add(1)
-		default:
-			s.counters.misses.Add(1)
-			if wasExpired {
-				s.counters.expirations.Add(1)
-			}
-		}
+	return v, st, s, refresh
+}
+
+// read is lookup for Get and Lookup, starting the refresh it claims with the
+// loader in Options. It repeats lookup rather than calling it: neither inlines,
+// and the extra call cost 4 ns of a 20 ns hit under a coarse clock.
+func (c *core[K, V]) read(key K) (V, Status) {
+	s := c.shardFor(key)
+	v, st, wasExpired, refresh := s.get(key, c.now(), c.getRefresher)
+	c.countLookup(s, st, wasExpired)
+	if refresh {
+		c.refresh(background, key, c.loader)
 	}
 
-	return v, st, s
+	return v, st
+}
+
+func (c *core[K, V]) countLookup(s *shard[K, V], st Status, wasExpired bool) {
+	if !c.countStats {
+		return
+	}
+	switch st {
+	case StatusHit:
+		s.counters.hits.Add(1)
+	case StatusNegative:
+		s.counters.negatives.Add(1)
+	default:
+		s.counters.misses.Add(1)
+		if wasExpired {
+			s.counters.expirations.Add(1)
+		}
+	}
+}
+
+// refresherWith is who a read is when it would refresh with loader: the cache,
+// or nobody when refresh is off or there is nothing to load with.
+func (c *core[K, V]) refresherWith(loader func(context.Context, K) (V, error)) refresher {
+	if c.refreshAfter > 0 && loader != nil {
+		return refreshCache
+	}
+
+	return refreshNone
 }
 
 func (c *core[K, V]) shardIndex(key K) uint64 {
@@ -552,21 +627,39 @@ func (c *core[K, V]) now() int64 {
 
 // expiryAt turns a TTL into an absolute deadline, spreading it by Jitter percent.
 func (c *core[K, V]) expiryAt(ttl time.Duration) int64 {
+	expiresAt, _ := c.deadlines(ttl, 0)
+
+	return expiresAt
+}
+
+// deadlines is expiryAt along with the time to refresh. The refresh sits the same
+// fraction of the way through the entry's life whatever Jitter made of it, so it
+// moves with the expiry and never lands after it.
+func (c *core[K, V]) deadlines(ttl, refreshAfter time.Duration) (expiresAt, refreshAt int64) {
 	if ttl <= 0 {
-		return 0
+		return 0, 0
 	}
 
+	life := ttl
 	if c.jitter > 0 {
 		if span := int64(ttl) * c.jitter / 100; span > 0 {
-			ttl += time.Duration(rand.Int64N(2*span+1) - span)
+			life += time.Duration(rand.Int64N(2*span+1) - span)
 		}
 		// Full jitter can land on zero, which would mean "never expires".
-		if ttl <= 0 {
-			ttl = 1
+		if life <= 0 {
+			life = 1
 		}
 	}
 
-	return c.now() + int64(ttl)
+	now := c.now()
+	expiresAt = now + int64(life)
+	if refreshAfter > 0 && refreshAfter < ttl {
+		// In floating point because the exact product of two durations overflows.
+		at := int64(float64(refreshAfter) * (float64(life) / float64(ttl)))
+		refreshAt = now + max(at, 1)
+	}
+
+	return expiresAt, refreshAt
 }
 
 func (c *core[K, V]) notify(e *entry[K, V], r EvictReason) {
