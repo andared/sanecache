@@ -68,26 +68,27 @@ func (c *Cache[K, V]) GetOrLoadFunc(ctx context.Context, key K, load func(contex
 // cached answers a load from the cache when it can, starting a refresh with
 // loader when the value it answers with is due for one. done is false only when
 // the key is a miss and the caller still has time to wait for a load.
-func (c *Cache[K, V]) cached(ctx context.Context, key K, loader func(context.Context, K) (V, error)) (v V, done bool, err error) {
+func (c *Cache[K, V]) cached(ctx context.Context, key K, loader func(context.Context, K) (V, error)) (V, bool, error) {
 	v, st, _, refresh := c.core.lookup(key, c.core.refresherWith(loader))
 	if refresh {
 		c.core.refresh(ctx, key, loader)
 	}
 
-	switch st {
-	case StatusHit:
+	return answered(ctx, v, st)
+}
+
+// answered is cached's verdict on a lookup. ctx is checked after the lookup: a
+// cached answer is worth having even to a caller who has run out of time.
+func answered[V any](ctx context.Context, v V, st Status) (V, bool, error) {
+	if st == StatusHit {
 		return v, true, nil
-	case StatusNegative:
+	}
+	if st == StatusNegative {
 		return v, true, ErrNotFound
 	}
+	err := ctx.Err()
 
-	// Checked after the lookup: a cached answer is worth having even to a caller
-	// who has already run out of time, and costs nothing to give.
-	if err := ctx.Err(); err != nil {
-		return v, true, err
-	}
-
-	return v, false, nil
+	return v, err != nil, err
 }
 
 // call is one load in flight. Waiters read val and err only after done is
@@ -118,12 +119,47 @@ func newFlightGroup[K comparable, V any]() *flightGroup[K, V] {
 	return &flightGroup[K, V]{calls: make(map[K]*call[V])}
 }
 
+// running returns key's load if one is in flight and not invalidated. The caller
+// holds g.mu.
+func (g *flightGroup[K, V]) running(key K) *call[V] {
+	cl := g.calls[key]
+	if cl == nil || (cl.token != nil && !cl.token.valid.Load()) {
+		return nil
+	}
+
+	return cl
+}
+
+// startAndUnlock registers a load of key with one waiter, unlocks g.mu and runs
+// the load on a goroutine of its own. The load outlives the caller that starts
+// it, so it takes the caller's values but not its cancellation: see
+// call.waiters.
+func (g *flightGroup[K, V]) startAndUnlock(
+	ctx context.Context, key K, token *loadToken, run func(context.Context, *call[V]),
+) *call[V] {
+	loadCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	cl := &call[V]{done: make(chan struct{}), waiters: 1, cancel: cancel, token: token}
+	g.calls[key] = cl
+	g.mu.Unlock()
+	go run(loadCtx, cl)
+
+	return cl
+}
+
+// drop takes cl out of the map unless a newer load has replaced it. The caller
+// holds g.mu.
+func (g *flightGroup[K, V]) drop(key K, cl *call[V]) {
+	if g.calls[key] == cl {
+		delete(g.calls, key)
+	}
+}
+
 func (c *core[K, V]) load(ctx context.Context, key K, loader func(context.Context, K) (V, error)) (V, error) {
 	idx := c.shardIndex(key)
 	g, s := c.flights[idx], c.shards[idx]
 
 	g.mu.Lock()
-	if cl, ok := g.calls[key]; ok && cl.token.valid.Load() {
+	if cl := g.running(key); cl != nil {
 		cl.waiters++
 		g.mu.Unlock()
 		c.countCoalesced(s)
@@ -154,14 +190,9 @@ func (c *core[K, V]) load(ctx context.Context, key K, loader func(context.Contex
 		return v, nil
 	}
 
-	// The load outlives the caller that starts it, so it does not inherit that
-	// caller's cancellation: values yes, deadline no. See call.waiters.
-	loadCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	cl := &call[V]{done: make(chan struct{}), waiters: 1, cancel: cancel, token: token}
-	g.calls[key] = cl
-	g.mu.Unlock()
-
-	go c.run(loadCtx, g, s, key, cl, loader, false)
+	cl := g.startAndUnlock(ctx, key, token, func(ctx context.Context, cl *call[V]) {
+		c.run(ctx, g, s, key, cl, loader, false)
+	})
 
 	return g.wait(ctx, key, cl)
 }
@@ -175,7 +206,7 @@ func (c *core[K, V]) refresh(ctx context.Context, key K, loader func(context.Con
 	g, s := c.flights[idx], c.shards[idx]
 
 	g.mu.Lock()
-	if cl, ok := g.calls[key]; ok && cl.token.valid.Load() {
+	if g.running(key) != nil {
 		g.mu.Unlock()
 
 		return
@@ -183,13 +214,9 @@ func (c *core[K, V]) refresh(ctx context.Context, key K, loader func(context.Con
 
 	// The refresh is a waiter of its own that never leaves, so that a caller
 	// who joins it and gives up cannot cancel a load the cache asked for.
-	token := s.beginLoad(key)
-	loadCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	cl := &call[V]{done: make(chan struct{}), waiters: 1, cancel: cancel, token: token}
-	g.calls[key] = cl
-	g.mu.Unlock()
-
-	go c.run(loadCtx, g, s, key, cl, loader, true)
+	g.startAndUnlock(ctx, key, s.beginLoad(key), func(ctx context.Context, cl *call[V]) {
+		c.run(ctx, g, s, key, cl, loader, true)
+	})
 }
 
 func (c *core[K, V]) countCoalesced(s *shard[K, V]) {
@@ -269,8 +296,8 @@ func (g *flightGroup[K, V]) leave(key K, cl *call[V]) {
 	g.mu.Lock()
 	cl.waiters--
 	last := cl.waiters == 0
-	if last && g.calls[key] == cl {
-		delete(g.calls, key)
+	if last {
+		g.drop(key, cl)
 	}
 	g.mu.Unlock()
 
@@ -284,9 +311,7 @@ func (g *flightGroup[K, V]) leave(key K, cl *call[V]) {
 // that has already been handed out.
 func (g *flightGroup[K, V]) finish(key K, cl *call[V]) {
 	g.mu.Lock()
-	if g.calls[key] == cl {
-		delete(g.calls, key)
-	}
+	g.drop(key, cl)
 	g.mu.Unlock()
 
 	close(cl.done)

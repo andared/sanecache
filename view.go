@@ -90,7 +90,7 @@ type View[T any] struct {
 	flights []*flightGroup[string, T]
 
 	// stats is shared by every view of this name on this cache.
-	stats *viewCounters
+	stats *counters
 }
 
 // NewView opens a view named o.Name onto c. It panics on a name that cannot keep
@@ -120,7 +120,7 @@ func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 			name:       o.Name,
 			prefix:     o.Name + viewSeparator,
 			countStats: true,
-			stats:      new(viewCounters),
+			stats:      new(counters),
 			flights:    []*flightGroup[string, T]{newFlightGroup[string, T]()},
 		}
 
@@ -272,7 +272,7 @@ func (v *View[T]) Delete(key string) bool {
 // with the same name on the same cache share them, as they share the keys. The
 // cache's own Stats counts the same lookups across every view.
 func (v *View[T]) Stats() ViewStats {
-	return v.stats.snapshot()
+	return v.stats.viewStats()
 }
 
 // ViewStats returns a snapshot of the counters of every view opened on the
@@ -284,27 +284,28 @@ func (c *Cache[K, V]) ViewStats() map[string]ViewStats {
 
 	stats := make(map[string]ViewStats, len(c.core.views))
 	for name, counters := range c.core.views {
-		stats[name] = counters.snapshot()
+		stats[name] = counters.viewStats()
 	}
 
 	return stats
 }
 
 // viewCounters returns the counters for a view name, creating them on first use.
-func (c *core[K, V]) viewCounters(name string) *viewCounters {
+// A view uses only some of them.
+func (c *core[K, V]) viewCounters(name string) *counters {
 	c.viewsMu.Lock()
 	defer c.viewsMu.Unlock()
 
 	if c.views == nil {
-		c.views = make(map[string]*viewCounters)
+		c.views = make(map[string]*counters)
 	}
-	counters, ok := c.views[name]
+	cs, ok := c.views[name]
 	if !ok {
-		counters = new(viewCounters)
-		c.views[name] = counters
+		cs = new(counters)
+		c.views[name] = cs
 	}
 
-	return counters
+	return cs
 }
 
 // refresherWith is who a read of this view is when it would refresh with loader.
@@ -327,25 +328,6 @@ func (v *View[T]) valueCost(value T) int64 {
 func (v *View[T]) count(c *atomic.Int64) {
 	if v.countStats {
 		c.Add(1)
-	}
-}
-
-func (v *View[T]) countLoad(o loadOutcome, refresh bool) {
-	if refresh {
-		v.count(&v.stats.refreshes)
-		if o == loadFailed {
-			v.count(&v.stats.refreshErrors)
-		}
-
-		return
-	}
-
-	v.count(&v.stats.loads)
-	switch o {
-	case loadNotFound:
-		v.count(&v.stats.loadNotFound)
-	case loadFailed:
-		v.count(&v.stats.loadErrors)
 	}
 }
 
@@ -382,20 +364,7 @@ func (s ViewStats) HitRate() float64 {
 	return float64(s.Hits+s.Negatives) / float64(total)
 }
 
-type viewCounters struct {
-	hits          atomic.Int64
-	misses        atomic.Int64
-	negatives     atomic.Int64
-	typeMisses    atomic.Int64
-	loads         atomic.Int64
-	loadNotFound  atomic.Int64
-	loadErrors    atomic.Int64
-	coalesced     atomic.Int64
-	refreshes     atomic.Int64
-	refreshErrors atomic.Int64
-}
-
-func (c *viewCounters) snapshot() ViewStats {
+func (c *counters) viewStats() ViewStats {
 	return ViewStats{
 		Hits:          c.hits.Load(),
 		Misses:        c.misses.Load(),

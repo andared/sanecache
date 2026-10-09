@@ -146,7 +146,7 @@ func (c *core[K, V]) acquire(ctx context.Context, keys []K, found map[K]V) (wait
 		g, s := c.flights[idx], c.shards[idx]
 
 		g.mu.Lock()
-		if cl, ok := g.calls[key]; ok && cl.token.valid.Load() {
+		if cl := g.running(key); cl != nil {
 			cl.waiters++
 			g.mu.Unlock()
 			c.countCoalesced(s)
@@ -212,7 +212,7 @@ func (c *core[K, V]) refreshMany(ctx context.Context, keys []K) {
 		g, s := c.flights[idx], c.shards[idx]
 
 		g.mu.Lock()
-		if cl, ok := g.calls[key]; ok && cl.token.valid.Load() {
+		if g.running(key) != nil {
 			g.mu.Unlock()
 
 			continue
