@@ -6,6 +6,8 @@ While the major version is 0, the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-09
+
 ### Added
 
 - `Options.RefreshAfter` and `ViewOptions.RefreshAfter`: a value read after it is this old
@@ -32,7 +34,10 @@ While the major version is 0, the public API may change in any release.
 - The comparison benchmarks include theine and sturdyc, `make bench-compare` adds a serial
   `Get` and five runs of each, and the README tables are medians of those runs.
 - The README compares features with otter, theine, sturdyc and ttlcache, including what
-  they do that this library does not, and points to sturdyc for background refresh.
+  they do that this library does not.
+- The `GetOrLoadFunc` and `GetManyOrLoad` examples had each other's descriptions on
+  pkg.go.dev.
+- The README and the doc comments are shorter, with nothing taken out of what they promise.
 
 ## [0.7.0] - 2026-09-30
 
@@ -199,7 +204,8 @@ First cut.
 - Built-in counters via `Stats`, and an `OnEvict` callback carrying a reason.
 - `ErrTooLarge` from `Set` for values that can never fit.
 
-[Unreleased]: https://github.com/andared/sanecache/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/andared/sanecache/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/andared/sanecache/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/andared/sanecache/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/andared/sanecache/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/andared/sanecache/compare/v0.4.0...v0.5.0

@@ -50,7 +50,7 @@ func main() {
 
 ```sh
 go mod init example.com/cache-demo
-go get github.com/andared/sanecache@v0.7.0
+go get github.com/andared/sanecache@v0.8.0
 go run .
 ```
 
@@ -483,6 +483,6 @@ against it, and value types with costs of their own
 
 ## Status
 
-v0.7. The API above is what exists and is tested; expect it to move before v1.
+v0.8. The API above is what exists and is tested; expect it to move before v1.
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for what this library
 optimises for. MIT licensed.
