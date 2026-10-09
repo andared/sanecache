@@ -203,7 +203,7 @@ type core[K comparable, V any] struct {
 	onEvict      func(K, V, EvictReason)
 	countStats   bool
 
-	loader      func(context.Context, K) (V, error)
+	loader      loadFunc[K, V]
 	batchLoader func(context.Context, []K) (map[K]V, error)
 	flights     []*flightGroup[K, V]
 
@@ -258,11 +258,11 @@ func New[K comparable, V any](o Options[K, V]) *Cache[K, V] {
 		cost:         o.Cost,
 		onEvict:      o.OnEvict,
 		countStats:   !o.DisableStats,
-		loader:       o.Loader,
+		loader:       unsized(o.Loader),
 		batchLoader:  o.BatchLoader,
 	}
 	if cr.loader == nil && cr.batchLoader != nil {
-		cr.loader = cr.loadAsBatch
+		cr.loader = unsized(cr.loadAsBatch)
 	}
 	cr.getRefresher = cr.refresherWith(cr.loader)
 
@@ -332,6 +332,13 @@ func (c *Cache[K, V]) Set(key K, value V) error {
 // means the entry never expires on its own.
 func (c *Cache[K, V]) SetTTL(key K, value V, ttl time.Duration) error {
 	return c.core.setValue(key, value, c.core.valueCost(value), ttl, c.core.refreshAfter, refreshCache)
+}
+
+// SetWithCost is Set with the value's cost given instead of taken from
+// Options.Cost, for a value whose size is known only where it was produced. A
+// negative cost counts as zero.
+func (c *Cache[K, V]) SetWithCost(key K, value V, cost int64) error {
+	return c.core.setValue(key, value, max(cost, 0), c.core.ttl, c.core.refreshAfter, refreshCache)
 }
 
 // SetNegative records that the upstream reports no such key, for the configured
@@ -525,7 +532,7 @@ func (c *core[K, V]) countLookup(s *shard[K, V], st Status, wasExpired bool) {
 
 // refresherWith is who a read is when it would refresh with loader: the cache,
 // or nobody when refresh is off or there is nothing to load with.
-func (c *core[K, V]) refresherWith(loader func(context.Context, K) (V, error)) refresher {
+func (c *core[K, V]) refresherWith(loader loadFunc[K, V]) refresher {
 	if c.refreshAfter > 0 && loader != nil {
 		return refreshCache
 	}

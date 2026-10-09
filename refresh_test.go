@@ -527,7 +527,7 @@ func TestRefreshLeavesARunningLoadToPublish(t *testing.T) {
 	defer c.Close()
 	g := c.core.flights[c.core.shardIndex("k")]
 	cl := running(g, "k")
-	c.core.refresh(context.Background(), "k", never)
+	c.core.refresh(context.Background(), "k", unsized(never))
 	if g.calls["k"] != cl {
 		t.Fatal("refresh replaced the running load")
 	}
@@ -550,7 +550,7 @@ func TestRefreshLeavesARunningLoadToPublish(t *testing.T) {
 	v := NewView(vc, ViewOptions[int]{Name: "v", RefreshAfter: refreshAfter, Loader: never})
 	vg := v.flights[vc.core.shardIndex("v:k")]
 	vcl := running(vg, "k")
-	v.refresh(context.Background(), "k", never)
+	v.refresh(context.Background(), "k", unsized(never))
 	if vg.calls["k"] != vcl {
 		t.Fatal("a view refresh replaced the running load")
 	}

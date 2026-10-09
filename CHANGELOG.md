@@ -15,6 +15,9 @@ While the major version is 0, the public API may change in any release.
   leaves the value to its TTL, which is never extended. Off by default; it must be shorter
   than the TTL.
 - `Stats.Refreshes` and `Stats.RefreshErrors`, also in `ViewStats`, apart from `Loads`.
+- `SetWithCost` and `GetOrLoadFuncWithCost` on `Cache` and `View`: the value's cost comes
+  with it instead of from the `Cost` function, for values whose size is known only where
+  they are produced, such as the length of the response they were decoded from.
 
 ### Changed
 

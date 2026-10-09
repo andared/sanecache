@@ -24,11 +24,7 @@ func (c *Cache[K, V]) GetOrLoad(ctx context.Context, key K) (V, error) {
 
 		return zero, ErrNoLoader
 	}
-	if v, done, err := c.cached(ctx, key, c.core.loader); done {
-		return v, err
-	}
-
-	return c.core.load(ctx, key, c.core.loader)
+	return c.getOrLoad(ctx, key, c.core.loader)
 }
 
 // GetOrLoadFunc is GetOrLoad with the loader passed in, for upstream calls that
@@ -41,7 +37,33 @@ func (c *Cache[K, V]) GetOrLoadFunc(ctx context.Context, key K, load func(contex
 
 		return zero, ErrNoLoader
 	}
-	loader := func(ctx context.Context, _ K) (V, error) { return load(ctx) }
+	return c.getOrLoad(ctx, key, func(ctx context.Context, _ K) (V, int64, error) {
+		v, err := load(ctx)
+
+		return v, -1, err
+	})
+}
+
+// GetOrLoadFuncWithCost is GetOrLoadFunc for a load that reports the cost of
+// what it returns, which is used instead of Options.Cost, for values whose size
+// is known only where they are produced. A negative cost counts as zero.
+func (c *Cache[K, V]) GetOrLoadFuncWithCost(
+	ctx context.Context, key K, load func(context.Context) (V, int64, error),
+) (V, error) {
+	if load == nil {
+		var zero V
+
+		return zero, ErrNoLoader
+	}
+
+	return c.getOrLoad(ctx, key, func(ctx context.Context, _ K) (V, int64, error) {
+		v, cost, err := load(ctx)
+
+		return v, max(cost, 0), err
+	})
+}
+
+func (c *Cache[K, V]) getOrLoad(ctx context.Context, key K, loader loadFunc[K, V]) (V, error) {
 	if v, done, err := c.cached(ctx, key, loader); done {
 		return v, err
 	}
@@ -49,9 +71,26 @@ func (c *Cache[K, V]) GetOrLoadFunc(ctx context.Context, key K, load func(contex
 	return c.core.load(ctx, key, loader)
 }
 
+// loadFunc is a loader that also reports the cost of what it loaded, or -1 for
+// the cost to come from the Cost function.
+type loadFunc[K comparable, V any] func(context.Context, K) (V, int64, error)
+
+// unsized turns a loader from the options into a loadFunc, keeping nil nil.
+func unsized[K comparable, V any](load func(context.Context, K) (V, error)) loadFunc[K, V] {
+	if load == nil {
+		return nil
+	}
+
+	return func(ctx context.Context, key K) (V, int64, error) {
+		v, err := load(ctx, key)
+
+		return v, -1, err
+	}
+}
+
 // cached answers a load from the cache when it can, starting the refresh it
 // claims with loader. It reports false only for a miss the caller can wait for.
-func (c *Cache[K, V]) cached(ctx context.Context, key K, loader func(context.Context, K) (V, error)) (V, bool, error) {
+func (c *Cache[K, V]) cached(ctx context.Context, key K, loader loadFunc[K, V]) (V, bool, error) {
 	v, st, _, refresh := c.core.lookup(key, c.core.refresherWith(loader))
 	if refresh {
 		c.core.refresh(ctx, key, loader)
@@ -132,7 +171,7 @@ func (g *flightGroup[K, V]) drop(key K, cl *call[V]) {
 	}
 }
 
-func (c *core[K, V]) load(ctx context.Context, key K, loader func(context.Context, K) (V, error)) (V, error) {
+func (c *core[K, V]) load(ctx context.Context, key K, loader loadFunc[K, V]) (V, error) {
 	idx := c.shardIndex(key)
 	g, s := c.flights[idx], c.shards[idx]
 
@@ -173,7 +212,7 @@ func (c *core[K, V]) load(ctx context.Context, key K, loader func(context.Contex
 
 // refresh reloads key in the background ahead of its expiry, as an ordinary
 // flight that callers may join, unless a load of the key is already running.
-func (c *core[K, V]) refresh(ctx context.Context, key K, loader func(context.Context, K) (V, error)) {
+func (c *core[K, V]) refresh(ctx context.Context, key K, loader loadFunc[K, V]) {
 	idx := c.shardIndex(key)
 	g, s := c.flights[idx], c.shards[idx]
 
@@ -201,14 +240,17 @@ func (c *core[K, V]) countCoalesced(s *shard[K, V]) {
 // a refresh.
 func (c *core[K, V]) run(
 	ctx context.Context, g *flightGroup[K, V], s *shard[K, V], key K, cl *call[V],
-	loader func(context.Context, K) (V, error), refresh bool,
+	loader loadFunc[K, V], refresh bool,
 ) {
 	defer s.endLoad(key, cl.token)
 	g.run(key, cl, func() (V, error) {
-		v, err := loader(ctx, key)
+		v, cost, err := loader(ctx, key)
+		if cost < 0 {
+			cost = c.valueCost(v)
+		}
 		switch {
 		case err == nil:
-			_ = c.setValue(key, v, c.valueCost(v), c.ttl, c.refreshAfter, refreshCache, cl.token)
+			_ = c.setValue(key, v, cost, c.ttl, c.refreshAfter, refreshCache, cl.token)
 		case errors.Is(err, ErrNotFound):
 			_ = c.setNegative(key, c.negativeTTL, cl.token)
 		}
