@@ -63,9 +63,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # Pinned with the linter, not stable: golangci-lint v2.13.2 cannot read the
+      # export data of Go 1.27.2. Move both together.
       - uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version: 1.27.1
           cache: false
       - uses: golangci/golangci-lint-action@v9
         with:
