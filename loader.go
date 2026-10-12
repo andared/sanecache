@@ -172,8 +172,7 @@ func (g *flightGroup[K, V]) drop(key K, cl *call[V]) {
 }
 
 func (c *core[K, V]) load(ctx context.Context, key K, loader loadFunc[K, V]) (V, error) {
-	idx := c.shardIndex(key)
-	g, s := c.flights[idx], c.shards[idx]
+	g, s := c.flightFor(key)
 
 	g.mu.Lock()
 	if cl := g.running(key); cl != nil {
@@ -184,13 +183,8 @@ func (c *core[K, V]) load(ctx context.Context, key K, loader loadFunc[K, V]) (V,
 		return g.wait(ctx, key, cl)
 	}
 
-	token := s.beginLoad(key)
-
-	// A load that finished since the caller's lookup has left the map but
-	// published first, so looking again under the lock makes "one load per key"
-	// exact. Not counted: the caller's lookup already was.
-	if v, st, _, _ := s.get(key, c.now(), refreshNone); st != StatusMiss {
-		s.endLoad(key, token)
+	token, v, st := s.beginLoadUnlessCached(key, c.now(), nil)
+	if token == nil {
 		g.mu.Unlock()
 		c.countCoalesced(s)
 
@@ -213,8 +207,7 @@ func (c *core[K, V]) load(ctx context.Context, key K, loader loadFunc[K, V]) (V,
 // refresh reloads key in the background ahead of its expiry, as an ordinary
 // flight that callers may join, unless a load of the key is already running.
 func (c *core[K, V]) refresh(ctx context.Context, key K, loader loadFunc[K, V]) {
-	idx := c.shardIndex(key)
-	g, s := c.flights[idx], c.shards[idx]
+	g, s := c.flightFor(key)
 
 	g.mu.Lock()
 	if g.running(key) != nil {
@@ -236,8 +229,6 @@ func (c *core[K, V]) countCoalesced(s *shard[K, V]) {
 	}
 }
 
-// run performs the load and publishes the result; refresh says it is counted as
-// a refresh.
 func (c *core[K, V]) run(
 	ctx context.Context, g *flightGroup[K, V], s *shard[K, V], key K, cl *call[V],
 	loader loadFunc[K, V], refresh bool,
@@ -280,7 +271,6 @@ func (g *flightGroup[K, V]) run(key K, cl *call[V], load func() (V, error), reco
 	cl.val, cl.err = load()
 }
 
-// wait blocks until the load finishes or ctx is done, whichever comes first.
 func (g *flightGroup[K, V]) wait(ctx context.Context, key K, cl *call[V]) (V, error) {
 	select {
 	case <-cl.done:

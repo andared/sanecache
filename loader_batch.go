@@ -118,8 +118,7 @@ func (b *batchLoad) join() context.CancelFunc {
 // call's cancel is set before anyone else can see the call.
 func (c *core[K, V]) acquire(ctx context.Context, keys []K, found map[K]V) (waits, fresh []flight[K, V], batch *batchLoad) {
 	for _, key := range keys {
-		idx := c.shardIndex(key)
-		g, s := c.flights[idx], c.shards[idx]
+		g, s := c.flightFor(key)
 
 		g.mu.Lock()
 		if cl := g.running(key); cl != nil {
@@ -131,10 +130,8 @@ func (c *core[K, V]) acquire(ctx context.Context, keys []K, found map[K]V) (wait
 			continue
 		}
 
-		// The same recheck as load's.
-		token := s.beginLoad(key)
-		if v, st, _, _ := s.get(key, c.now(), refreshNone); st != StatusMiss {
-			s.endLoad(key, token)
+		token, v, st := s.beginLoadUnlessCached(key, c.now(), nil)
+		if token == nil {
 			g.mu.Unlock()
 			c.countCoalesced(s)
 			if st == StatusHit {
@@ -144,7 +141,6 @@ func (c *core[K, V]) acquire(ctx context.Context, keys []K, found map[K]V) (wait
 			continue
 		}
 
-		// Values, but not cancellation, as in startAndUnlock.
 		cl := &call[V]{done: make(chan struct{}), waiters: 1, token: token}
 		var loadCtx context.Context
 		if c.batchLoader != nil {
@@ -182,8 +178,7 @@ func (c *core[K, V]) refreshMany(ctx context.Context, keys []K) {
 	batch := &batchLoad{}
 	batch.ctx, batch.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	for _, key := range keys {
-		idx := c.shardIndex(key)
-		g, s := c.flights[idx], c.shards[idx]
+		g, s := c.flightFor(key)
 
 		g.mu.Lock()
 		if g.running(key) != nil {
