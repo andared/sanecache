@@ -207,7 +207,7 @@ func (v *View[T]) SetTTL(key string, value T, ttl time.Duration) error {
 		return ErrDisabled
 	}
 
-	return v.cache.core.setValue(v.prefix+key, value, v.valueCost(value), ttl, v.refreshAfter, refreshView)
+	return v.cache.core.setValue(v.prefix+key, value, v.valueCost(value), ttl, v.refreshAfter, refreshView, nil)
 }
 
 // SetWithCost is Cache.SetWithCost for this view, with the view's TTL.
@@ -216,7 +216,7 @@ func (v *View[T]) SetWithCost(key string, value T, cost int64) error {
 		return ErrDisabled
 	}
 
-	return v.cache.core.setValue(v.prefix+key, value, max(cost, 0), v.ttl, v.refreshAfter, refreshView)
+	return v.cache.core.setValue(v.prefix+key, value, max(cost, 0), v.ttl, v.refreshAfter, refreshView, nil)
 }
 
 // SetNegative records that the upstream reports no such key, for the view's
@@ -231,7 +231,7 @@ func (v *View[T]) SetNegativeTTL(key string, ttl time.Duration) error {
 		return ErrDisabled
 	}
 
-	return v.cache.core.setNegative(v.prefix+key, ttl)
+	return v.cache.core.setNegative(v.prefix+key, ttl, nil)
 }
 
 // Delete is Cache.Delete for this view's key, invalidating its loads in any view
@@ -264,7 +264,6 @@ func (c *Cache[K, V]) ViewStats() map[string]ViewStats {
 	return stats
 }
 
-// viewCounters returns the counters of a view name, creating them on first use.
 func (c *core[K, V]) viewCounters(name string) *counters {
 	c.viewsMu.Lock()
 	defer c.viewsMu.Unlock()

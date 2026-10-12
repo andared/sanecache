@@ -51,7 +51,6 @@ func (e *entry[K, V]) expired(now int64) bool {
 	return e.expiresAt != 0 && now >= e.expiresAt
 }
 
-// shard is an independently locked slice of the cache.
 type shard[K comparable, V any] struct {
 	mu    sync.RWMutex
 	items map[K]*entry[K, V]
@@ -153,9 +152,9 @@ func (s *shard[K, V]) get(key K, now int64, by refresher) (_ V, _ Status, expire
 	return e.value, StatusHit, false, refresh
 }
 
-// set stores e, returning the entry it replaced and those evicted to make room.
-// A value that cannot fit on its own is refused with ErrTooLarge.
-func (s *shard[K, V]) set(e *entry[K, V], tokens ...*loadToken) (replaced *entry[K, V], victims []*entry[K, V], err error) {
+// set stores e, unless token was invalidated since its load began: then it
+// stores nothing and reports no error.
+func (s *shard[K, V]) set(e *entry[K, V], token *loadToken) (replaced *entry[K, V], victims []*entry[K, V], err error) {
 	if s.maxBytes > 0 && e.cost > s.maxBytes {
 		return nil, nil, ErrTooLarge
 	}
@@ -163,7 +162,7 @@ func (s *shard[K, V]) set(e *entry[K, V], tokens ...*loadToken) (replaced *entry
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if len(tokens) > 0 && !tokens[0].valid.Load() {
+	if token != nil && !token.valid.Load() {
 		return nil, nil, nil
 	}
 	s.invalidateLoads(e.key)
@@ -194,7 +193,6 @@ func (s *shard[K, V]) delete(key K) (*entry[K, V], bool) {
 	return e, true
 }
 
-// sweep drops every entry that has expired by now.
 func (s *shard[K, V]) sweep(now int64) []*entry[K, V] {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -265,7 +263,7 @@ func (s *shard[K, V]) over() bool {
 		(s.maxEntries > 0 && len(s.items) > s.maxEntries)
 }
 
-// remove unlinks e from both the map and the LRU list. Callers hold the lock.
+// remove is called with s.mu held, as are the list helpers below.
 func (s *shard[K, V]) remove(e *entry[K, V]) {
 	delete(s.items, e.key)
 	s.unlink(e)
@@ -322,6 +320,24 @@ func (s *shard[K, V]) beginLoad(key K) *loadToken {
 	}
 	s.loads[key][token] = struct{}{}
 	return token
+}
+
+// beginLoadUnlessCached is beginLoad unless key has gained an answer since the
+// caller's lookup, which it returns with a nil token instead. The caller holds
+// the key's flight group lock: a load that finished in between has left the
+// flight map but published first, and looking again makes "one load per key"
+// exact. accept, if set, says which hits count as an answer. The lookup is not
+// counted: the caller's already was.
+func (s *shard[K, V]) beginLoadUnlessCached(key K, now int64, accept func(V) bool) (*loadToken, V, Status) {
+	token := s.beginLoad(key)
+	v, st, _, _ := s.get(key, now, refreshNone)
+	if st == StatusNegative || (st == StatusHit && (accept == nil || accept(v))) {
+		s.endLoad(key, token)
+
+		return nil, v, st
+	}
+
+	return token, v, StatusMiss
 }
 
 func (s *shard[K, V]) endLoad(key K, token *loadToken) {
