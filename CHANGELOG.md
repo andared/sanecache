@@ -6,6 +6,10 @@ While the major version is 0, the public API may change in any release.
 
 ## [Unreleased]
 
+### Changed
+
+- `Len` and `Bytes` read only the shard sizes instead of taking a full `Stats` snapshot.
+
 ## [0.8.0] - 2026-10-09
 
 ### Added

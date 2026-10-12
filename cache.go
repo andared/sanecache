@@ -331,25 +331,25 @@ func (c *Cache[K, V]) Set(key K, value V) error {
 // SetTTL caches value under key for ttl, overriding Options.TTL. A ttl of zero
 // means the entry never expires on its own.
 func (c *Cache[K, V]) SetTTL(key K, value V, ttl time.Duration) error {
-	return c.core.setValue(key, value, c.core.valueCost(value), ttl, c.core.refreshAfter, refreshCache)
+	return c.core.setValue(key, value, c.core.valueCost(value), ttl, c.core.refreshAfter, refreshCache, nil)
 }
 
 // SetWithCost is Set with the value's cost given instead of taken from
 // Options.Cost, for a value whose size is known only where it was produced. A
 // negative cost counts as zero.
 func (c *Cache[K, V]) SetWithCost(key K, value V, cost int64) error {
-	return c.core.setValue(key, value, max(cost, 0), c.core.ttl, c.core.refreshAfter, refreshCache)
+	return c.core.setValue(key, value, max(cost, 0), c.core.ttl, c.core.refreshAfter, refreshCache, nil)
 }
 
 // SetNegative records that the upstream reports no such key, for the configured
 // NegativeTTL. A successful write supersedes outstanding loads.
 func (c *Cache[K, V]) SetNegative(key K) error {
-	return c.core.setNegative(key, c.core.negativeTTL)
+	return c.core.setNegative(key, c.core.negativeTTL, nil)
 }
 
 // SetNegativeTTL is SetNegative with an explicit lifetime.
 func (c *Cache[K, V]) SetNegativeTTL(key K, ttl time.Duration) error {
-	return c.core.setNegative(key, ttl)
+	return c.core.setNegative(key, ttl, nil)
 }
 
 // Delete removes key and reports whether it was present. It also invalidates
@@ -371,10 +371,26 @@ func (c *Cache[K, V]) Clear() {
 }
 
 // Len reports how many entries are held, including expired ones not yet swept.
-func (c *Cache[K, V]) Len() int { return c.Stats().Entries }
+func (c *Cache[K, V]) Len() int {
+	n := 0
+	for _, s := range c.core.shards {
+		entries, _ := s.stats()
+		n += entries
+	}
+
+	return n
+}
 
 // Bytes reports the summed cost of the entries held.
-func (c *Cache[K, V]) Bytes() int64 { return c.Stats().Bytes }
+func (c *Cache[K, V]) Bytes() int64 {
+	var n int64
+	for _, s := range c.core.shards {
+		_, bytes := s.stats()
+		n += bytes
+	}
+
+	return n
+}
 
 // Stats returns a snapshot of the counters. It walks every shard, so poll it on
 // a metrics interval rather than per request.
@@ -428,7 +444,7 @@ func (c *core[K, V]) valueCost(v V) int64 {
 // read by owner may refresh it; zero, or anything not shorter than ttl, means
 // never.
 func (c *core[K, V]) setValue(
-	key K, value V, cost int64, ttl, refreshAfter time.Duration, owner refresher, tokens ...*loadToken,
+	key K, value V, cost int64, ttl, refreshAfter time.Duration, owner refresher, token *loadToken,
 ) error {
 	e := &entry[K, V]{key: key, value: value, cost: cost, byView: owner == refreshView}
 	var refreshAt int64
@@ -438,10 +454,10 @@ func (c *core[K, V]) setValue(
 		e.refreshAt.Store(refreshAt)
 	}
 
-	return c.store(e, tokens...)
+	return c.store(e, token)
 }
 
-func (c *core[K, V]) setNegative(key K, ttl time.Duration, tokens ...*loadToken) error {
+func (c *core[K, V]) setNegative(key K, ttl time.Duration, token *loadToken) error {
 	if ttl <= 0 {
 		return ErrNegativeDisabled
 	}
@@ -457,13 +473,13 @@ func (c *core[K, V]) setNegative(key K, ttl time.Duration, tokens ...*loadToken)
 		cost:      cost,
 		expiresAt: c.expiryAt(ttl),
 		negative:  true,
-	}, tokens...)
+	}, token)
 }
 
-func (c *core[K, V]) store(e *entry[K, V], tokens ...*loadToken) error {
+func (c *core[K, V]) store(e *entry[K, V], token *loadToken) error {
 	s := c.shardFor(e.key)
 
-	replaced, victims, err := s.set(e, tokens...)
+	replaced, victims, err := s.set(e, token)
 	if err != nil {
 		if c.countStats {
 			s.counters.rejections.Add(1)
@@ -550,6 +566,12 @@ func (c *core[K, V]) shardIndex(key K) uint64 {
 
 func (c *core[K, V]) shardFor(key K) *shard[K, V] {
 	return c.shards[c.shardIndex(key)]
+}
+
+func (c *core[K, V]) flightFor(key K) (*flightGroup[K, V], *shard[K, V]) {
+	i := c.shardIndex(key)
+
+	return c.flights[i], c.shards[i]
 }
 
 // now is the time expiry is judged against: the wall clock, or what the clock

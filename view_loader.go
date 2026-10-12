@@ -94,8 +94,7 @@ func (v *View[T]) loadUncached(ctx context.Context, key string, loader loadFunc[
 func (v *View[T]) load(ctx context.Context, key string, loader loadFunc[string, T]) (T, error) {
 	c := v.cache.core
 	fullKey := v.prefix + key
-	idx := c.shardIndex(fullKey)
-	g, s := v.flights[idx], c.shards[idx]
+	g, s := v.flightFor(fullKey)
 	coalesced := func() {
 		v.count(&v.stats.coalesced)
 		v.count(&s.counters.coalesced)
@@ -109,12 +108,8 @@ func (v *View[T]) load(ctx context.Context, key string, loader loadFunc[string, 
 
 		return g.wait(ctx, key, cl)
 	}
-	token := s.beginLoad(fullKey)
-	// load's recheck; a value of another type still needs loading.
-	raw, st, _, _ := s.get(fullKey, c.now(), refreshNone)
-	val, typed := raw.(T)
-	if st == StatusNegative || (st == StatusHit && typed) {
-		s.endLoad(fullKey, token)
+	token, raw, st := s.beginLoadUnlessCached(fullKey, c.now(), isType[T])
+	if token == nil {
 		g.mu.Unlock()
 		coalesced()
 		if st == StatusNegative {
@@ -123,7 +118,7 @@ func (v *View[T]) load(ctx context.Context, key string, loader loadFunc[string, 
 			return zero, ErrNotFound
 		}
 
-		return val, nil
+		return raw.(T), nil
 	}
 	cl := g.startAndUnlock(ctx, key, token, func(ctx context.Context, cl *call[T]) {
 		v.run(ctx, g, s, key, cl, loader, false)
@@ -134,10 +129,8 @@ func (v *View[T]) load(ctx context.Context, key string, loader loadFunc[string, 
 
 // refresh is Cache's refresh for a view's key, with the view's loader.
 func (v *View[T]) refresh(ctx context.Context, key string, loader loadFunc[string, T]) {
-	c := v.cache.core
 	fullKey := v.prefix + key
-	idx := c.shardIndex(fullKey)
-	g, s := v.flights[idx], c.shards[idx]
+	g, s := v.flightFor(fullKey)
 
 	g.mu.Lock()
 	if g.running(key) != nil {
@@ -177,4 +170,16 @@ func (v *View[T]) run(
 			s.counters.countLoad(o, refresh)
 		}
 	})
+}
+
+func (v *View[T]) flightFor(fullKey string) (*flightGroup[string, T], *shard[string, any]) {
+	i := v.cache.core.shardIndex(fullKey)
+
+	return v.flights[i], v.cache.core.shards[i]
+}
+
+func isType[T any](v any) bool {
+	_, ok := v.(T)
+
+	return ok
 }

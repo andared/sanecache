@@ -73,7 +73,6 @@ func since(cur, prev int64) int64 {
 	return cur - prev
 }
 
-// addTo folds one shard's counters into a snapshot.
 func (c *counters) addTo(s *Stats) {
 	s.Hits += c.hits.Load()
 	s.Misses += c.misses.Load()
@@ -92,7 +91,6 @@ func (c *counters) addTo(s *Stats) {
 	s.RefreshErrors += c.refreshErrors.Load()
 }
 
-// countLoad records one completed load, or refresh when it was one.
 func (c *counters) countLoad(o loadOutcome, refresh bool) {
 	if refresh {
 		c.refreshes.Add(1)
