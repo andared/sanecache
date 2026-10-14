@@ -1,6 +1,7 @@
 package sanecache
 
 import (
+	"maps"
 	"testing"
 	"time"
 )
@@ -207,6 +208,43 @@ func TestViewTTL(t *testing.T) {
 	}
 	if _, ok := long.Get("1"); !ok {
 		t.Fatal("a view without a TTL of its own did not inherit the cache's")
+	}
+}
+
+func TestViewAll(t *testing.T) {
+	c := newViewCache(Options[string, any]{Shards: 4})
+	defer c.Close()
+
+	articles := NewView(c, ViewOptions[*article]{Name: "article"})
+	seasons := NewView(c, ViewOptions[*season]{Name: "season"})
+	want := map[string]*article{"1": {id: "1"}, "3": {id: "3"}}
+	for k, a := range want {
+		if err := articles.Set(k, a); err != nil {
+			t.Fatalf("articles.Set: %v", err)
+		}
+	}
+	if err := seasons.Set("1", &season{num: 1}); err != nil {
+		t.Fatalf("seasons.Set: %v", err)
+	}
+	// Under the view's prefix, but of another type.
+	if err := c.Set("article:2", 2); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	if got := maps.Collect(articles.All()); !maps.Equal(got, want) {
+		t.Fatalf("All = %v; want %v", got, want)
+	}
+	n := 0
+	for range articles.All() {
+		n++
+		break
+	}
+	if n != 1 {
+		t.Fatalf("the loop ran %d times after break", n)
+	}
+
+	for range NewView(nil, ViewOptions[int]{Name: "off"}).All() {
+		t.Fatal("a view without a cache yielded a value")
 	}
 }
 

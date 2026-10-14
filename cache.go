@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"hash/maphash"
+	"iter"
 	"math/bits"
 	"math/rand/v2"
 	"runtime"
@@ -367,6 +368,29 @@ func (c *Cache[K, V]) Delete(key K) bool {
 func (c *Cache[K, V]) Clear() {
 	for _, s := range c.core.shards {
 		s.clear()
+	}
+}
+
+// All iterates over the cached values, for dumping a cache or copying it into
+// another. Each shard is copied under its read lock and yielded after, so the
+// loop may use the cache, and it sees each shard as it was when reached rather
+// than the whole cache at one moment. Negative and expired entries are skipped.
+// Iterating counts no lookups, reorders nothing and starts no refresh.
+func (c *Cache[K, V]) All() iter.Seq2[K, V] {
+	return c.core.all(nil)
+}
+
+// all is All over the keys keep accepts.
+func (c *core[K, V]) all(keep func(K) bool) iter.Seq2[K, V] {
+	return func(yield func(K, V) bool) {
+		for _, s := range c.shards {
+			keys, values := s.live(c.now(), keep)
+			for i, k := range keys {
+				if !yield(k, values[i]) {
+					return
+				}
+			}
+		}
 	}
 }
 

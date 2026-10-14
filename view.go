@@ -3,6 +3,7 @@ package sanecache
 import (
 	"context"
 	"fmt"
+	"iter"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -242,6 +243,26 @@ func (v *View[T]) Delete(key string) bool {
 	}
 
 	return v.cache.Delete(v.prefix + key)
+}
+
+// All is Cache.All for this view's values, by the caller's keys. It walks the
+// whole cache, skipping the entries of other views and values of another type.
+func (v *View[T]) All() iter.Seq2[string, T] {
+	return func(yield func(string, T) bool) {
+		if v.cache == nil {
+			return
+		}
+		mine := func(k string) bool { return strings.HasPrefix(k, v.prefix) }
+		for k, raw := range v.cache.core.all(mine) {
+			val, ok := raw.(T)
+			if !ok {
+				continue
+			}
+			if !yield(k[len(v.prefix):], val) {
+				return
+			}
+		}
+	}
 }
 
 // Stats returns the counters of this view's name, shared by every view of that

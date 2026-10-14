@@ -221,6 +221,23 @@ func (s *shard[K, V]) clear() {
 	s.head, s.tail, s.bytes = nil, nil, 0
 }
 
+// live copies out the values that have not expired by now and whose key keep
+// accepts; a nil keep accepts every key.
+func (s *shard[K, V]) live(now int64, keep func(K) bool) (keys []K, values []V) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for k, e := range s.items {
+		if e.negative || e.expired(now) || (keep != nil && !keep(k)) {
+			continue
+		}
+		keys = append(keys, k)
+		values = append(values, e.value)
+	}
+
+	return keys, values
+}
+
 func (s *shard[K, V]) stats() (entries int, bytes int64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

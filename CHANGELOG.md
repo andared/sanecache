@@ -6,6 +6,13 @@ While the major version is 0, the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- `Cache.All` and `View.All`: iterators over the cached values, for dumping a cache or
+  warming another from it. A shard is copied under its read lock and yielded after it, so
+  the loop may use the cache; negative and expired entries are skipped, and nothing is
+  counted or reordered.
+
 ### Changed
 
 - Requires Go 1.25, for `testing/synctest` in the tests; Go 1.24 is past its support window.

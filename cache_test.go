@@ -2,6 +2,7 @@ package sanecache
 
 import (
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -427,6 +428,48 @@ func TestBackgroundSweeperRuns(t *testing.T) {
 			t.Fatal("sweeper did not drop the expired entry")
 		}
 	})
+}
+
+func TestAll(t *testing.T) {
+	c := New(Options[string, int]{Shards: 4, NegativeTTL: time.Hour, DisableCleanup: true})
+	defer c.Close()
+	advance := manualClock(c)
+
+	want := map[string]int{"a": 1, "b": 2, "c": 3, "d": 4, "e": 5}
+	for k, v := range want {
+		if err := c.Set(k, v); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+	}
+	if err := c.SetNegative("gone"); err != nil {
+		t.Fatalf("SetNegative: %v", err)
+	}
+	if err := c.SetTTL("old", 6, time.Minute); err != nil {
+		t.Fatalf("SetTTL: %v", err)
+	}
+	advance(time.Minute)
+
+	if got := maps.Collect(c.All()); !maps.Equal(got, want) {
+		t.Fatalf("All = %v; want %v", got, want)
+	}
+	if st := c.Stats(); st.Hits+st.Misses+st.Negatives != 0 {
+		t.Fatalf("All counted lookups: %+v", st)
+	}
+
+	// The shard locks are not held while the loop body runs.
+	for k, v := range c.All() {
+		if err := c.Set(k+"!", v); err != nil {
+			t.Fatalf("Set inside All: %v", err)
+		}
+	}
+	n := 0
+	for range c.All() {
+		n++
+		break
+	}
+	if n != 1 {
+		t.Fatalf("the loop ran %d times after break", n)
+	}
 }
 
 func TestCloseIsIdempotentAndLeavesTheCacheUsable(t *testing.T) {
