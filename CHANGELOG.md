@@ -12,6 +12,10 @@ While the major version is 0, the public API may change in any release.
   warming another from it. A shard is copied under its read lock and yielded after it, so
   the loop may use the cache; negative and expired entries are skipped, and nothing is
   counted or reordered.
+- `ViewOptions.BatchLoader` and `View.GetManyOrLoad`: batch loading for a view, by the
+  caller's keys, with the cache's semantics: single flight and invalidation per key,
+  `GetOrLoad` through the batch loader when there is no `Loader`, due keys refreshed in one
+  call. `ViewStats.Batches` counts the calls.
 
 ### Changed
 

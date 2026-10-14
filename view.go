@@ -25,6 +25,11 @@ type ViewOptions[T any] struct {
 	// not load its own key through this view.
 	Loader func(context.Context, string) (T, error)
 
+	// BatchLoader is Options.BatchLoader for this view, by the caller's keys:
+	// GetManyOrLoad's missing keys in one call, and GetOrLoad's key when Loader
+	// is not set. Batches coalesce with this View instance's loads, as Loader's do.
+	BatchLoader func(context.Context, []string) (map[string]T, error)
+
 	// Cost is Options.Cost for this view's values, sparing the cache's Cost a type
 	// switch. Unset, the cache's Cost is used.
 	Cost func(T) int64
@@ -62,8 +67,9 @@ type View[T any] struct {
 	// getRefresher is refresherWith(loader), worked out once.
 	getRefresher refresher
 
-	loader  loadFunc[string, T]
-	flights []*flightGroup[string, T]
+	loader      loadFunc[string, T]
+	batchLoader func(context.Context, []string) (map[string]T, error)
+	flights     []*flightGroup[string, T]
 
 	// stats is shared by every view of this name on this cache.
 	stats *counters
@@ -90,12 +96,16 @@ func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 
 	if c == nil {
 		v := &View[T]{
-			loader:     unsized(o.Loader),
-			name:       o.Name,
-			prefix:     o.Name + viewSeparator,
-			countStats: true,
-			stats:      new(counters),
-			flights:    []*flightGroup[string, T]{newFlightGroup[string, T]()},
+			loader:      unsized(o.Loader),
+			batchLoader: o.BatchLoader,
+			name:        o.Name,
+			prefix:      o.Name + viewSeparator,
+			countStats:  true,
+			stats:       new(counters),
+			flights:     []*flightGroup[string, T]{newFlightGroup[string, T]()},
+		}
+		if v.loader == nil && v.batchLoader != nil {
+			v.loader = unsized(v.loadAsBatch)
 		}
 
 		return v
@@ -104,6 +114,7 @@ func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 	v := &View[T]{
 		cache:       c,
 		loader:      unsized(o.Loader),
+		batchLoader: o.BatchLoader,
 		name:        o.Name,
 		prefix:      o.Name + viewSeparator,
 		cost:        o.Cost,
@@ -123,6 +134,9 @@ func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 			o.RefreshAfter, v.ttl))
 	}
 	v.refreshAfter = o.RefreshAfter
+	if v.loader == nil && v.batchLoader != nil {
+		v.loader = unsized(v.loadAsBatch)
+	}
 	v.getRefresher = v.refresherWith(v.loader)
 
 	// Made with or without a view loader: GetOrLoadFunc brings its own.
@@ -335,9 +349,10 @@ type ViewStats struct {
 	// only two views of one name or writes straight to the cache cause them.
 	TypeMisses int64
 
-	Loads        int64 // completed loader calls, including errors and panics
+	Loads        int64 // keys loaded by Loader or BatchLoader, successfully or not
 	LoadNotFound int64 // completed loader calls that returned ErrNotFound
 	LoadErrors   int64 // completed loader calls that failed otherwise, or panicked
+	Batches      int64 // BatchLoader calls
 	Coalesced    int64 // calls spared a load by another caller
 
 	Refreshes     int64 // completed refreshes started by RefreshAfter
@@ -352,7 +367,7 @@ func (s ViewStats) Sub(prev ViewStats) ViewStats {
 	}{
 		{&s.Hits, prev.Hits}, {&s.Misses, prev.Misses}, {&s.Negatives, prev.Negatives},
 		{&s.TypeMisses, prev.TypeMisses}, {&s.Loads, prev.Loads}, {&s.LoadNotFound, prev.LoadNotFound},
-		{&s.LoadErrors, prev.LoadErrors}, {&s.Coalesced, prev.Coalesced},
+		{&s.LoadErrors, prev.LoadErrors}, {&s.Batches, prev.Batches}, {&s.Coalesced, prev.Coalesced},
 		{&s.Refreshes, prev.Refreshes}, {&s.RefreshErrors, prev.RefreshErrors},
 	} {
 		*f.cur = since(*f.cur, f.prev)
@@ -381,6 +396,7 @@ func (c *counters) viewStats() ViewStats {
 		Loads:         c.loads.Load(),
 		LoadNotFound:  c.loadNotFound.Load(),
 		LoadErrors:    c.loadErrors.Load(),
+		Batches:       c.batches.Load(),
 		Coalesced:     c.coalesced.Load(),
 		Refreshes:     c.refreshes.Load(),
 		RefreshErrors: c.refreshErrors.Load(),
