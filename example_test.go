@@ -329,3 +329,33 @@ func ExampleView_GetOrLoad() {
 	// missing: true
 	// loads: 2 total: 2
 }
+
+// A view's batch loader is asked for the caller's ids, without the view's prefix.
+func ExampleView_GetManyOrLoad() {
+	c := sanecache.New(sanecache.Options[string, any]{TTL: time.Minute})
+	defer c.Close()
+	seasons := sanecache.NewView(c, sanecache.ViewOptions[*season]{
+		Name: "season",
+		BatchLoader: func(_ context.Context, ids []string) (map[string]*season, error) {
+			fmt.Println("asked for", len(ids))
+			found := make(map[string]*season, len(ids))
+			for i, id := range ids {
+				found[id] = &season{Num: i + 1}
+			}
+
+			return found, nil
+		},
+	})
+
+	_ = seasons.Set("1", &season{Num: 1})
+	got, err := seasons.GetManyOrLoad(context.Background(), []string{"1", "2", "3"})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println("found:", len(got), "batches:", seasons.Stats().Batches)
+
+	// Output:
+	// asked for 2
+	// found: 3 batches: 1
+}

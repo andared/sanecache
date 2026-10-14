@@ -338,7 +338,7 @@ func TestBatchRechecksTheCacheBeforeStartingOver(t *testing.T) {
 		t.Fatalf("SetNegative: %v", err)
 	}
 	found := make(map[string]int)
-	waits, fresh, batch := c.core.acquire(context.Background(), []string{"k", "gone"}, found)
+	waits, fresh, batch := acquire[string, int](context.Background(), c.core, []string{"k", "gone"}, found)
 	if len(waits) != 0 || len(fresh) != 0 || batch != nil {
 		t.Fatalf("acquire started loads: %d waits, %d fresh", len(waits), len(fresh))
 	}
@@ -540,7 +540,7 @@ func TestGetManyOrLoadCarriesAPanicToTheCaller(t *testing.T) {
 			if !ok || !strings.Contains(err.Error(), "boom") {
 				t.Fatalf("recovered %v; want an error naming the panic", r)
 			}
-			if !strings.Contains(err.Error(), "sanecache.(*core[...]).runBatch") {
+			if !strings.Contains(err.Error(), "sanecache.runBatch") {
 				t.Fatalf("recovered error lost the loader's stack: %v", err)
 			}
 		}()

@@ -543,7 +543,7 @@ func TestRefreshLeavesARunningLoadToPublish(t *testing.T) {
 	defer b.Close()
 	running(b.core.flights[b.core.shardIndex("x")], "x")
 	running(b.core.flights[b.core.shardIndex("y")], "y")
-	b.core.refreshMany(context.Background(), []string{"x", "y"})
+	refreshMany[string, int](context.Background(), b.core, []string{"x", "y"})
 
 	vc := New(Options[string, any]{TTL: refreshTTL, DisableCleanup: true})
 	defer vc.Close()
