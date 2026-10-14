@@ -564,7 +564,7 @@ func TestBudgetWithoutCostForInterfaceValues(t *testing.T) {
 }
 
 func TestConcurrentUse(t *testing.T) {
-	for _, policy := range []Policy{LRU, ClearOnFull} {
+	for _, policy := range []Policy{LRU, ClearOnFull, S3FIFO} {
 		t.Run(policy.String(), func(t *testing.T) {
 			c := New(Options[int, int]{
 				TTL:             50 * time.Millisecond,

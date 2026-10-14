@@ -51,9 +51,9 @@ type factory struct {
 
 func factories() []factory {
 	return []factory{
-		// Four rows because each one is a knob, and the point is what each is
-		// worth: the defaults, then sharding, then the coarse clock, then the
-		// policy that does not reorder a list on every read.
+		// A row per knob, because the point is what each is worth: the
+		// defaults, then sharding, then the coarse clock, then the two
+		// policies that do not reorder a list on every read.
 		{"sanecache", func() cache { return openSane(0, 0, sanecache.LRU) }},
 		{"sanecache-sharded", func() cache { return openSane(16, 0, sanecache.LRU) }},
 		{"sanecache-coarse-clock", func() cache {
@@ -61,6 +61,9 @@ func factories() []factory {
 		}},
 		{"sanecache-clear-on-full", func() cache {
 			return openSane(16, time.Millisecond, sanecache.ClearOnFull)
+		}},
+		{"sanecache-s3-fifo", func() cache {
+			return openSane(16, time.Millisecond, sanecache.S3FIFO)
 		}},
 		{"otter", openOtter},
 		{"theine", openTheine},

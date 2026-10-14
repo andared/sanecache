@@ -279,7 +279,7 @@ func TestViewLoaderPanicAndRetry(t *testing.T) {
 }
 
 func TestViewLoadsShareBudgetAndInheritOptions(t *testing.T) {
-	for _, policy := range []Policy{LRU, ClearOnFull} {
+	for _, policy := range []Policy{LRU, ClearOnFull, S3FIFO} {
 		t.Run(fmt.Sprint(policy), func(t *testing.T) {
 			c := New(Options[string, any]{MaxBytes: 512, Cost: func(any) int64 { return 256 }, TTL: time.Minute, NegativeTTL: time.Minute, DisableCleanup: true, Policy: policy})
 			defer c.Close()

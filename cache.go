@@ -53,11 +53,22 @@ const (
 	// eviction when access order is flat and refilling is cheap relative to
 	// the bookkeeping.
 	ClearOnFull
+
+	// S3FIFO keeps a new entry in a small queue until it is read again, which
+	// lets out keys read only once before they displace the ones in steady use,
+	// and gives an entry in the main queue another round for each read. Reads
+	// take only a read lock, as with ClearOnFull, and Set still always stores.
+	// Near W-TinyLFU's hit rate when the working set does not fit (see the
+	// README).
+	S3FIFO
 )
 
 func (p Policy) String() string {
-	if p == ClearOnFull {
+	switch p {
+	case ClearOnFull:
 		return "clear-on-full"
+	case S3FIFO:
+		return "s3-fifo"
 	}
 
 	return "lru"

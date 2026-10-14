@@ -16,11 +16,10 @@ While the major version is 0, the public API may change in any release.
   caller's keys, with the cache's semantics: single flight and invalidation per key,
   `GetOrLoad` through the batch loader when there is no `Loader`, due keys refreshed in one
   call. `ViewStats.Batches` counts the calls.
-
-### Fixed
-
-- A failed load no longer has its zero value passed to `Cost`, which since 0.8.0 turned a
-  `Cost` that reads through a nil pointer into a loader panic.
+- `S3FIFO`, an eviction policy that keeps new entries in a small queue until they are read
+  again and remembers the keys it lets out. Reads take only a read lock, as with
+  `ClearOnFull`, and `Set` still always stores. In the comparison benchmarks it matches
+  otter and theine on hit rate, where LRU trails them by 5.7 points.
 
 ### Changed
 
@@ -31,6 +30,11 @@ While the major version is 0, the public API may change in any release.
   and its key. Other caches still panic without `Cost`.
 - `New` and `NewView` panic when `TTL`, `NegativeTTL` or `RefreshAfter` is shorter than ten
   `ClockGranularity` intervals, where expiry would be off by more than a tenth of it.
+
+### Fixed
+
+- A failed load no longer has its zero value passed to `Cost`, which since 0.8.0 turned a
+  `Cost` that reads through a nil pointer into a loader panic.
 
 ## [0.8.0] - 2026-10-09
 
