@@ -115,7 +115,7 @@ func (v *View[T]) publish(_ uint64, skey string, val T, err error, token *loadTo
 	c := v.cache.core
 	switch {
 	case err == nil:
-		_ = c.setValue(skey, val, v.valueCost(val), v.ttl, v.refreshAfter, refreshView, token)
+		_ = c.setValue(skey, val, v.valueCost(skey, val), v.ttl, v.refreshAfter, refreshView, token)
 	case errors.Is(err, ErrNotFound):
 		_ = c.setNegative(skey, v.negativeTTL, token)
 	}

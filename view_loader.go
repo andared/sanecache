@@ -163,7 +163,7 @@ func (v *View[T]) run(
 		switch {
 		case err == nil:
 			if cost < 0 {
-				cost = v.valueCost(value)
+				cost = v.valueCost(fullKey, value)
 			}
 			_ = c.setValue(fullKey, value, cost, v.ttl, v.refreshAfter, refreshView, cl.token)
 		case errors.Is(err, ErrNotFound):

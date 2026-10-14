@@ -1,6 +1,7 @@
 package sanecache
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"strings"
@@ -496,6 +497,15 @@ func TestPanicsOnUnworkableOptions(t *testing.T) {
 		"negative granularity": func() {
 			New(Options[string, int]{ClockGranularity: -time.Second})
 		},
+		"ttl under 10 clock intervals": func() {
+			New(Options[string, int]{TTL: time.Second, ClockGranularity: 101 * time.Millisecond})
+		},
+		"negative ttl under 10 clock intervals": func() {
+			New(Options[string, int]{NegativeTTL: time.Second, ClockGranularity: time.Second})
+		},
+		"refresh under 10 clock intervals": func() {
+			New(Options[string, int]{TTL: time.Hour, RefreshAfter: time.Second, ClockGranularity: time.Second})
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			defer func() {
@@ -505,6 +515,51 @@ func TestPanicsOnUnworkableOptions(t *testing.T) {
 			}()
 			build()
 		})
+	}
+}
+
+func TestCoarseClockAllowsTenIntervals(t *testing.T) {
+	c := New(Options[string, any]{TTL: time.Second, ClockGranularity: 100 * time.Millisecond})
+	defer c.Close()
+	NewView(c, ViewOptions[int]{Name: "v", TTL: time.Second, NegativeTTL: time.Second})
+
+	// Only configured lifetimes are checked; a per-call TTL is the caller's.
+	if err := c.SetTTL("k", 1, time.Millisecond); err != nil {
+		t.Fatalf("SetTTL: %v", err)
+	}
+}
+
+// TestBudgetWithoutCostForInterfaceValues: a cache of any may leave Cost to its
+// views, and what is written without a cost is charged as a negative entry is.
+func TestBudgetWithoutCostForInterfaceValues(t *testing.T) {
+	c := New(Options[string, any]{
+		MaxBytes: 1 << 20, NegativeTTL: time.Hour,
+		Loader: func(context.Context, string) (any, error) { return "loaded", nil },
+	})
+	defer c.Close()
+
+	v := NewView(c, ViewOptions[[]byte]{Name: "v", Cost: func(b []byte) int64 { return int64(len(b)) }})
+	if err := v.Set("a", make([]byte, 1000)); err != nil {
+		t.Fatalf("view Set: %v", err)
+	}
+	if got := c.Bytes(); got != 1000 {
+		t.Fatalf("Bytes = %d after a view write; want the view's cost, 1000", got)
+	}
+
+	if err := c.Set("ab", 1); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if _, err := c.GetOrLoad(context.Background(), "abc"); err != nil {
+		t.Fatalf("GetOrLoad: %v", err)
+	}
+	if err := c.SetNegative("abcd"); err != nil {
+		t.Fatalf("SetNegative: %v", err)
+	}
+	if err := c.SetWithCost("x", 1, 7); err != nil {
+		t.Fatalf("SetWithCost: %v", err)
+	}
+	if got, want := c.Bytes(), 1000+entryOverhead*3+2+3+4+7; got != want {
+		t.Fatalf("Bytes = %d; want %d", got, want)
 	}
 }
 

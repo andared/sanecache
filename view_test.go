@@ -398,9 +398,13 @@ func TestViewRespectsDisableStats(t *testing.T) {
 	}
 }
 
-func TestNewViewPanicsOnUnusableNames(t *testing.T) {
+func TestNewViewPanicsOnUnusableOptions(t *testing.T) {
 	c := newViewCache(Options[string, any]{})
 	defer c.Close()
+	budget := newViewCache(Options[string, any]{MaxBytes: 1 << 20})
+	defer budget.Close()
+	clocked := newViewCache(Options[string, any]{TTL: time.Hour, ClockGranularity: time.Second})
+	defer clocked.Close()
 
 	for name, build := range map[string]func(){
 		"nil cache, empty name": func() { NewView(nil, ViewOptions[*article]{}) },
@@ -415,11 +419,23 @@ func TestNewViewPanicsOnUnusableNames(t *testing.T) {
 		"negative negative ttl": func() {
 			NewView(c, ViewOptions[*article]{Name: "a", NegativeTTL: -time.Second})
 		},
+		"no cost under a budget without one": func() {
+			NewView(budget, ViewOptions[*article]{Name: "a"})
+		},
+		"ttl under 10 clock intervals": func() {
+			NewView(clocked, ViewOptions[*article]{Name: "a", TTL: time.Second})
+		},
+		"negative ttl under 10 clock intervals": func() {
+			NewView(clocked, ViewOptions[*article]{Name: "a", NegativeTTL: time.Second})
+		},
+		"refresh under 10 clock intervals": func() {
+			NewView(clocked, ViewOptions[*article]{Name: "a", RefreshAfter: time.Second})
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			defer func() {
 				if recover() == nil {
-					t.Fatal("NewView accepted options that cannot keep views apart")
+					t.Fatal("NewView accepted unusable options")
 				}
 			}()
 			build()

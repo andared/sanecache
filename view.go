@@ -129,6 +129,10 @@ func NewView[T any](c *Cache[string, any], o ViewOptions[T]) *View[T] {
 	if v.negativeTTL == 0 {
 		v.negativeTTL = c.core.negativeTTL
 	}
+	if c.core.keyCost && o.Cost == nil {
+		panic(fmt.Sprintf("sanecache: ViewOptions.Cost is required for view %q: the cache has MaxBytes but no Cost", o.Name))
+	}
+	checkClock(c.core.granularity, v.ttl, v.negativeTTL, o.RefreshAfter)
 	if o.RefreshAfter > 0 && (v.ttl == 0 || o.RefreshAfter >= v.ttl) {
 		panic(fmt.Sprintf("sanecache: ViewOptions.RefreshAfter must be shorter than the view's TTL, got %v with TTL %v",
 			o.RefreshAfter, v.ttl))
@@ -222,7 +226,9 @@ func (v *View[T]) SetTTL(key string, value T, ttl time.Duration) error {
 		return ErrDisabled
 	}
 
-	return v.cache.core.setValue(v.prefix+key, value, v.valueCost(value), ttl, v.refreshAfter, refreshView)
+	skey := v.prefix + key
+
+	return v.cache.core.setValue(skey, value, v.valueCost(skey, value), ttl, v.refreshAfter, refreshView)
 }
 
 // SetWithCost is Cache.SetWithCost for this view, with the view's TTL.
@@ -325,12 +331,13 @@ func (v *View[T]) refresherWith(loader loadFunc[string, T]) refresher {
 	return refreshNone
 }
 
-func (v *View[T]) valueCost(value T) int64 {
+// valueCost is the cost of a value stored under skey.
+func (v *View[T]) valueCost(skey string, value T) int64 {
 	if v.cost != nil {
 		return v.cost(value)
 	}
 
-	return v.cache.core.valueCost(value)
+	return v.cache.core.valueCost(skey, value)
 }
 
 func (v *View[T]) count(c *atomic.Int64) {
