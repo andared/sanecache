@@ -212,7 +212,7 @@ caller waits for any of its keys.
 
 With only a `BatchLoader`, `GetOrLoad` uses it with a batch of one; with only a `Loader`,
 `GetManyOrLoad` loads the missing keys concurrently. `Stats().Batches` counts batch calls.
-Views have no batch loading yet.
+Views load in batches the same way, with `ViewOptions.BatchLoader` and `View.GetManyOrLoad`.
 
 ## Refreshing before expiry
 
@@ -248,7 +248,6 @@ is the guess a byte budget was meant to avoid.
 c := sanecache.New(sanecache.Options[string, any]{
     TTL:      10 * time.Minute,
     MaxBytes: 64 << 20,
-    Cost:     func(any) int64 { return 256 }, // fallback for views without their own
 })
 defer c.Close()
 
@@ -258,6 +257,7 @@ articles := sanecache.NewView(c, sanecache.ViewOptions[*Article]{
 })
 seasons := sanecache.NewView(c, sanecache.ViewOptions[*Season]{
     Name: "season",
+    Cost: func(*Season) int64 { return 256 },
     TTL:  time.Hour, // seasons change less often than articles do
 })
 
@@ -265,9 +265,12 @@ a, ok := articles.Get(id) // a is a *Article, not an any
 ```
 
 A view fixes one value type, prefixes its keys with its name and can bring its own `Cost`
-and TTLs. Eviction stays global. Reads cost about 6 ns more than the cache underneath, and
-allocate once name and key exceed 32 bytes. `Stats().TypeMisses` counts lookups that found
-another type under a view's key: a bug detector for two views sharing a name.
+and TTLs. Eviction stays global. The cache's `Cost`, if it has one, is the fallback for
+views without their own; under `MaxBytes` without it, `NewView` requires one, and a value
+written to the cache directly is charged as a negative entry is, by its key. Reads cost
+about 6 ns more than the cache underneath, and allocate once name and key exceed 32 bytes.
+`Stats().TypeMisses` counts lookups that found another type under a view's key: a bug
+detector for two views sharing a name.
 
 Views load too:
 
@@ -353,6 +356,12 @@ At one lookup per request none of this matters, and `Shards: 0` is the right ans
 read lock, worth 20% on one shard and 40% sharded. It suits flat access orders where
 refilling is cheap, and costs hit rate: see the table below.
 
+`S3FIFO` keeps a new entry in a small queue, a tenth of the budget, until it is read again,
+so that keys read once leave before they push out the ones in steady use; an entry in the
+main queue gets another round for each read, up to three. Reads take a read lock, as with
+`ClearOnFull`, and the hit rate is the best of the three (see the table below). The cost is
+the hashes of recently evicted keys, at most one per entry the shard holds.
+
 ## The clock
 
 An uncontended hit costs 47 ns, and 27 ns of that is `time.Now()`. `ClockGranularity` has a
@@ -366,7 +375,8 @@ sanecache.Options[string, *Article]{
 ```
 
 A hit then costs 20 ns, and expiry is accurate to one interval either way: nothing against
-ten minutes, a lot against one second, which is why it is off by default. After `Close`,
+ten minutes, a lot against one second, which is why it is off by default. `New` and
+`NewView` panic on a `TTL`, `NegativeTTL` or `RefreshAfter` under ten intervals. After `Close`,
 lookups go back to the wall clock.
 
 ## Stats
@@ -390,6 +400,22 @@ exporter sends. Alert on `Rejections`: keys that can never be cached. `Coalesced
 single flight saves. `LoadErrors` leaves out `ErrNotFound`, which is in `LoadNotFound`, so
 ids that are gone do not look like failures.
 
+## Iterating
+
+`All` and `View.All` range over the cached values, for dumping a cache or warming another
+from it:
+
+```go
+for key, value := range old.All() {
+    _ = next.Set(key, value)
+}
+```
+
+The loop may use the cache: each shard is copied under its read lock and yielded after,
+so a large shard is copied whole, and the loop sees each shard as it was when reached, not
+the whole cache at one moment. Negative and expired entries are skipped, and iterating
+counts no lookups.
+
 ## Lifecycle
 
 A background goroutine sweeps expired entries off the budget. `Close()` stops it and the
@@ -399,29 +425,31 @@ expire only on lookup.
 ## How it compares
 
 The `benchmarks/` module, separate so the root stays dependency-free, measures this cache
-against the ones it would replace: `make bench-compare`. Same machine, Go 1.24, 256-byte
+against the ones it would replace: `make bench-compare`. Same machine, Go 1.25, 256-byte
 values, a budget of 4096 of them, medians of five runs. Each sanecache row adds a knob to the
-row above.
+row above; the `S3FIFO` row takes the place of `ClearOnFull`.
 
 | ns/op | serial `Get` | `Get` ×8 | `Set` ×8 | 90/10 ×8 |
 |---|---:|---:|---:|---:|
-| sanecache, defaults | 62 | 141 | 229 | 156 |
-| ⤷ `Shards: 16` | 64 | 42 | 90 | 49 |
-| ⤷ + `ClockGranularity` | 33 | 32 | 81 | 38 |
-| ⤷ + `ClearOnFull` | 31 | 19 | 86 | 38 |
-| [otter](https://github.com/maypok86/otter) v2 | 80 | 14 | 268 | 29 |
-| [theine](https://github.com/Yiling-J/theine-go) | 91 | 13 | 174 | 57 |
-| [ristretto](https://github.com/dgraph-io/ristretto) v2 | 87 | 21 | 252 | 70 |
-| [sturdyc](https://github.com/viccon/sturdyc) | 62 | 32 | 121 | 67 |
-| [golang-lru](https://github.com/hashicorp/golang-lru) `v2/expirable` | 54 | 140 | 185 | 168 |
-| [ttlcache](https://github.com/jellydator/ttlcache) v3 | 63 | 175 | 264 | 193 |
+| sanecache, defaults | 52 | 135 | 235 | 152 |
+| ⤷ `Shards: 16` | 54 | 41 | 94 | 48 |
+| ⤷ + `ClockGranularity` | 31 | 33 | 86 | 40 |
+| ⤷ + `ClearOnFull` | 30 | 20 | 94 | 37 |
+| ⤷ `S3FIFO` instead | 25 | 20 | 95 | 38 |
+| [otter](https://github.com/maypok86/otter) v2 | 70 | 12 | 254 | 27 |
+| [theine](https://github.com/Yiling-J/theine-go) | 90 | 13 | 169 | 54 |
+| [ristretto](https://github.com/dgraph-io/ristretto) v2 | 84 | 21 | 266 | 64 |
+| [sturdyc](https://github.com/viccon/sturdyc) | 65 | 30 | 117 | 64 |
+| [golang-lru](https://github.com/hashicorp/golang-lru) `v2/expirable` | 46 | 140 | 177 | 160 |
+| [ttlcache](https://github.com/jellydator/ttlcache) v3 | 60 | 169 | 254 | 193 |
 
 Per lookup this cache is *cheaper* than otter, theine and ristretto, which maintain a
 frequency sketch and ring buffers. What those buy is scaling: otter and theine turn eight
-cores into 6–7x the throughput, this one into 1.6x, because reads take a lock. At one lookup
-per request, 19 ns against 13 ns is nothing; it matters when a request does thousands of
-lookups. Writes are the other way round, 81–90 ns against 121–268: an admission policy costs
-more than a lock.
+cores into 6–7x the throughput, this one into 1.3–1.5x with `ClearOnFull` or `S3FIFO`,
+which read under a read lock, and none with LRU, which reads under a write lock. At one
+lookup per request, 20 ns against 12 ns is nothing; it matters when a request does
+thousands of lookups. Writes are the other way round, 86–95 ns against 117–266: an
+admission policy costs more than a lock.
 
 What usually matters more is how much of a fixed budget turns into hits. 4096 entries
 against 100,000 keys:
@@ -429,18 +457,20 @@ against 100,000 keys:
 | %hit | zipf s=1.20 | zipf s=1.01 | zipf + scan |
 |---|---:|---:|---:|
 | sanecache (LRU) | 87.3 | 65.8 | 78.0 |
-| sanecache (ClearOnFull) | 83.2 | 57.9 | 73.7 |
-| otter v2 | 88.9 | **71.3** | **80.8** |
-| theine | **89.0** | **71.3** | 80.7 |
-| ristretto v2 | 87.3 | 68.7 | 79.0 |
+| sanecache (ClearOnFull) | 83.1 | 57.9 | 73.7 |
+| sanecache (S3FIFO) | **89.1** | 71.3 | **81.0** |
+| otter v2 | 88.9 | **71.5** | 80.9 |
+| theine | 89.0 | 71.2 | 80.7 |
+| ristretto v2 | 87.4 | 68.7 | 78.9 |
 | sturdyc | 84.9 | 61.6 | 75.3 |
 | golang-lru `expirable` | 87.3 | 65.8 | 78.0 |
 | ttlcache v3 | 87.3 | 65.8 | 78.0 |
 
-When the hot set fits, policies differ by 1.7 points. When it does not, W-TinyLFU is worth
-5.5 points over LRU, and that much upstream traffic outweighs every nanosecond above: the
-real reason to pick otter or theine. `ClearOnFull` pays 7.9 points for its cheap reads;
-sturdyc, dropping a full shard's oldest tenth at once, pays 4.
+When the hot set fits, policies differ by under 2 points. When it does not, W-TinyLFU is
+worth 5.7 points over LRU, and that much upstream traffic outweighs every nanosecond above.
+`S3FIFO` gets the same within a fraction of a point, at the price of a `ClearOnFull` read,
+and without admission: a `Set` is still always stored. `ClearOnFull` pays 7.9 points for its
+cheap reads; sturdyc, dropping a full shard's oldest tenth at once, pays 4.2.
 
 ### The features are not the difference either
 
@@ -464,9 +494,9 @@ against it, and value types with costs of their own
 
 ## When to use something else
 
-- The best hit rate for a memory budget is worth admission policies and frequency
-  estimation → [otter](https://github.com/maypok86/otter). The hit-rate table above is the
-  size of the prize.
+- Writes should be refused when the newcomer is less likely to be read than what it would
+  evict → [otter](https://github.com/maypok86/otter) or theine, whose admission policy does
+  that; here a `Set` is always stored.
 - How a cache scales across cores is a real difference on your read path → otter or
   [ristretto](https://github.com/dgraph-io/ristretto); with ristretto, budget for `Wait()`
   in the tests.
