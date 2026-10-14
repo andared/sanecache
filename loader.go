@@ -248,7 +248,7 @@ func (c *core[K, V]) run(
 		switch {
 		case err == nil:
 			if cost < 0 {
-				cost = c.valueCost(v)
+				cost = c.valueCost(key, v)
 			}
 			_ = c.setValue(key, v, cost, c.ttl, c.refreshAfter, refreshCache, cl.token)
 		case errors.Is(err, ErrNotFound):

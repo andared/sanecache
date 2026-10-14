@@ -25,6 +25,12 @@ While the major version is 0, the public API may change in any release.
 ### Changed
 
 - Requires Go 1.25, for `testing/synctest` in the tests; Go 1.24 is past its support window.
+- `MaxBytes` no longer requires `Cost` when the value type is an interface, such as the
+  `any` of a cache used through views: `NewView` then requires the view's `Cost`, and a
+  value written to the cache without a cost is charged as a negative entry is, by the entry
+  and its key. Other caches still panic without `Cost`.
+- `New` and `NewView` panic when `TTL`, `NegativeTTL` or `RefreshAfter` is shorter than ten
+  `ClockGranularity` intervals, where expiry would be off by more than a tenth of it.
 
 ## [0.8.0] - 2026-10-09
 

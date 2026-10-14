@@ -366,7 +366,7 @@ func (c *core[K, V]) recheck(idx uint64, key K) (V, Status) {
 func (c *core[K, V]) publish(_ uint64, key K, v V, err error, token *loadToken) {
 	switch {
 	case err == nil:
-		_ = c.setValue(key, v, c.valueCost(v), c.ttl, c.refreshAfter, refreshCache, token)
+		_ = c.setValue(key, v, c.valueCost(key, v), c.ttl, c.refreshAfter, refreshCache, token)
 	case errors.Is(err, ErrNotFound):
 		_ = c.setNegative(key, c.negativeTTL, token)
 	}

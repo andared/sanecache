@@ -303,10 +303,12 @@ func ExampleNewView() {
 }
 
 func ExampleView_GetOrLoad() {
-	c := sanecache.New(sanecache.Options[string, any]{MaxBytes: 1024, Cost: func(any) int64 { return 64 }})
+	// A cache of any needs no Cost when each view brings its own.
+	c := sanecache.New(sanecache.Options[string, any]{MaxBytes: 1024})
 	defer c.Close()
 	articles := sanecache.NewView(c, sanecache.ViewOptions[*article]{
 		Name:        "article",
+		Cost:        func(a *article) int64 { return int64(len(a.Body)) * 3 },
 		NegativeTTL: time.Minute,
 		Loader: func(_ context.Context, id string) (*article, error) {
 			if id == "gone" {

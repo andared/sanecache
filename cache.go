@@ -12,6 +12,7 @@ import (
 	"iter"
 	"math/bits"
 	"math/rand/v2"
+	"reflect"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -114,7 +115,10 @@ type Options[K comparable, V any] struct {
 	RefreshAfter time.Duration
 
 	// MaxBytes is the budget in bytes, split evenly across shards. It requires
-	// Cost. Zero means unbounded.
+	// Cost, except for an interface V, such as the any of a cache used through
+	// views that bring their own Cost: values written without a cost are then
+	// charged as negative entries are, by the entry and its key. Zero means
+	// unbounded.
 	MaxBytes int64
 
 	// MaxEntries caps the number of entries, split evenly across shards. Zero
@@ -170,8 +174,9 @@ type Options[K comparable, V any] struct {
 	// ClockGranularity has a background goroutine read the clock this often,
 	// instead of every lookup paying for it, which is about half of what a lookup
 	// costs. Expiry is then accurate to one interval either way. Zero reads the
-	// clock every time. It works with DisableCleanup; Close returns lookups to the
-	// wall clock.
+	// clock every time. TTL, NegativeTTL and RefreshAfter, and a view's, must be
+	// at least 10 intervals, or expiry would be off by more than a tenth. It works
+	// with DisableCleanup; Close returns lookups to the wall clock.
 	ClockGranularity time.Duration
 
 	// OnEvict is called for every entry that leaves the cache other than by Delete
@@ -201,8 +206,13 @@ type core[K comparable, V any] struct {
 	refreshAfter time.Duration
 	jitter       int64
 	cost         func(V) int64
+	granularity  time.Duration
 	onEvict      func(K, V, EvictReason)
 	countStats   bool
+
+	// keyCost charges a value written without a cost as a negative entry: a
+	// byte budget with no Cost, which only an interface V may have.
+	keyCost bool
 
 	loader      loadFunc[K, V]
 	batchLoader func(context.Context, []K) (map[K]V, error)
@@ -235,7 +245,7 @@ func New[K comparable, V any](o Options[K, V]) *Cache[K, V] {
 		panic(fmt.Sprintf("sanecache: MaxBytes must not be negative, got %d", o.MaxBytes))
 	case o.MaxEntries < 0:
 		panic(fmt.Sprintf("sanecache: MaxEntries must not be negative, got %d", o.MaxEntries))
-	case o.MaxBytes > 0 && o.Cost == nil:
+	case o.MaxBytes > 0 && o.Cost == nil && reflect.TypeFor[V]().Kind() != reflect.Interface:
 		panic("sanecache: MaxBytes requires Cost; without it the budget would count entries, not bytes")
 	case o.TTL < 0 || o.NegativeTTL < 0:
 		panic("sanecache: TTL and NegativeTTL must not be negative")
@@ -246,6 +256,7 @@ func New[K comparable, V any](o Options[K, V]) *Cache[K, V] {
 	case o.RefreshAfter > 0 && (o.TTL == 0 || o.RefreshAfter >= o.TTL):
 		panic(fmt.Sprintf("sanecache: RefreshAfter must be shorter than TTL, got %v with TTL %v", o.RefreshAfter, o.TTL))
 	}
+	checkClock(o.ClockGranularity, o.TTL, o.NegativeTTL, o.RefreshAfter)
 
 	n := shardCount(o.Shards)
 	cr := &core[K, V]{
@@ -257,6 +268,8 @@ func New[K comparable, V any](o Options[K, V]) *Cache[K, V] {
 		refreshAfter: o.RefreshAfter,
 		jitter:       int64(o.Jitter),
 		cost:         o.Cost,
+		granularity:  o.ClockGranularity,
+		keyCost:      o.MaxBytes > 0 && o.Cost == nil,
 		onEvict:      o.OnEvict,
 		countStats:   !o.DisableStats,
 		loader:       unsized(o.Loader),
@@ -332,7 +345,7 @@ func (c *Cache[K, V]) Set(key K, value V) error {
 // SetTTL caches value under key for ttl, overriding Options.TTL. A ttl of zero
 // means the entry never expires on its own.
 func (c *Cache[K, V]) SetTTL(key K, value V, ttl time.Duration) error {
-	return c.core.setValue(key, value, c.core.valueCost(value), ttl, c.core.refreshAfter, refreshCache)
+	return c.core.setValue(key, value, c.core.valueCost(key, value), ttl, c.core.refreshAfter, refreshCache)
 }
 
 // SetWithCost is Set with the value's cost given instead of taken from
@@ -440,12 +453,29 @@ func negativeCost[K comparable](key K) int64 {
 	return entryOverhead
 }
 
-func (c *core[K, V]) valueCost(v V) int64 {
-	if c.cost == nil {
+// minClockSteps is how many ClockGranularity intervals a configured lifetime
+// must span: with fewer, expiry is off by more than a tenth of it.
+const minClockSteps = 10
+
+// checkClock panics if a lifetime is too short for the clock's granularity.
+func checkClock(granularity time.Duration, lifetimes ...time.Duration) {
+	for _, d := range lifetimes {
+		if granularity > 0 && d > 0 && d < minClockSteps*granularity {
+			panic(fmt.Sprintf("sanecache: ClockGranularity %v is too coarse for a lifetime of %v; it needs %d intervals",
+				granularity, d, minClockSteps))
+		}
+	}
+}
+
+func (c *core[K, V]) valueCost(key K, v V) int64 {
+	switch {
+	case c.cost != nil:
+		return c.cost(v)
+	case c.keyCost:
+		return negativeCost(key)
+	default:
 		return 0
 	}
-
-	return c.cost(v)
 }
 
 // setValue stores a value that expires after ttl. Once it is refreshAfter old, a
@@ -472,7 +502,7 @@ func (c *core[K, V]) setNegative(key K, ttl time.Duration, tokens ...*loadToken)
 
 	// Charged nothing, it would never be evicted by a byte budget.
 	var cost int64
-	if c.cost != nil {
+	if c.cost != nil || c.keyCost {
 		cost = negativeCost(key)
 	}
 
