@@ -66,7 +66,7 @@ func newRefreshCache(t *testing.T, policy Policy, loader func(context.Context, s
 // in steady use is replaced in the background, its readers never wait for the
 // upstream, and however many of them see it due, the upstream is asked once.
 func TestRefreshServesTheOldValueAndReloadsOnce(t *testing.T) {
-	for _, policy := range []Policy{LRU, ClearOnFull} {
+	for _, policy := range []Policy{LRU, ClearOnFull, S3FIFO} {
 		t.Run(policy.String(), func(t *testing.T) {
 			l := newVersionLoader()
 			c, advance := newRefreshCache(t, policy, l.load)

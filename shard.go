@@ -1,6 +1,7 @@
 package sanecache
 
 import (
+	"hash/maphash"
 	"sync"
 	"sync/atomic"
 )
@@ -22,6 +23,11 @@ type entry[K comparable, V any] struct {
 	// byView marks an entry a View wrote, which only a view may refresh: the
 	// cache's loader would be handed the prefixed key.
 	byView bool
+	// small marks an S3FIFO entry in the small queue rather than the main one.
+	small bool
+	// freq counts S3FIFO reads up to maxFreq, under what may be only the read
+	// lock, hence atomic. It fits in the padding after the bools.
+	freq atomic.Uint32
 
 	prev, next *entry[K, V] // head of the list is the most recently used entry
 }
@@ -61,6 +67,13 @@ type shard[K comparable, V any] struct {
 
 	head, tail *entry[K, V]
 
+	// S3FIFO keeps new entries in a small queue, and head and tail are its main
+	// one. ghosts remembers keys the small queue evicted.
+	smallHead, smallTail *entry[K, V]
+	smallBytes           int64
+	smallLen             int
+	ghosts               ghosts
+
 	bytes      int64
 	maxBytes   int64
 	maxEntries int
@@ -79,12 +92,17 @@ type shard[K comparable, V any] struct {
 const cacheLine = 64
 
 func newShard[K comparable, V any](maxBytes int64, maxEntries int, policy Policy) *shard[K, V] {
-	return &shard[K, V]{
+	s := &shard[K, V]{
 		items:      make(map[K]*entry[K, V]),
 		maxBytes:   maxBytes,
 		maxEntries: maxEntries,
 		policy:     policy,
 	}
+	if policy == S3FIFO {
+		s.ghosts = ghosts{seed: maphash.MakeSeed(), set: make(map[uint64]uint64)}
+	}
+
+	return s
 }
 
 // get returns the entry's value and status. expired reports a miss on an entry
@@ -92,9 +110,9 @@ func newShard[K comparable, V any](maxBytes int64, maxEntries int, policy Policy
 func (s *shard[K, V]) get(key K, now int64, by refresher) (_ V, _ Status, expired, refresh bool) {
 	var zero V
 
-	// ClearOnFull reorders nothing on access, so reads take only the read lock:
-	// that is the point of the policy.
-	if s.policy == ClearOnFull {
+	// ClearOnFull and S3FIFO reorder nothing on access, so reads take only the
+	// read lock: that is the point of both.
+	if s.policy != LRU {
 		s.mu.RLock()
 		e, ok := s.items[key]
 		if !ok {
@@ -117,6 +135,13 @@ func (s *shard[K, V]) get(key K, now int64, by refresher) (_ V, _ Status, expire
 			return zero, StatusMiss, removed, false
 		}
 
+		// Stored only below the cap, so that a hot key's reads do not keep
+		// writing to its cache line.
+		if s.policy == S3FIFO {
+			if f := e.freq.Load(); f < maxFreq {
+				e.freq.Store(f + 1)
+			}
+		}
 		status, value := StatusHit, e.value
 		if e.negative {
 			status, value = StatusNegative, zero
@@ -175,7 +200,11 @@ func (s *shard[K, V]) set(e *entry[K, V], tokens ...*loadToken) (replaced *entry
 
 	s.items[e.key] = e
 	s.bytes += e.cost
-	s.pushFront(e)
+	if s.policy == S3FIFO {
+		s.admit(e, replaced)
+	} else {
+		s.pushFront(e)
+	}
 
 	return replaced, s.evict(e), nil
 }
@@ -219,6 +248,8 @@ func (s *shard[K, V]) clear() {
 	}
 	s.items = make(map[K]*entry[K, V])
 	s.head, s.tail, s.bytes = nil, nil, 0
+	s.smallHead, s.smallTail, s.smallBytes, s.smallLen = nil, nil, 0, 0
+	s.ghosts.clear()
 }
 
 // live copies out the values that have not expired by now and whose key keep
@@ -252,6 +283,10 @@ func (s *shard[K, V]) evict(keep *entry[K, V]) []*entry[K, V] {
 		return nil
 	}
 
+	if s.policy == S3FIFO {
+		return s.evictS3FIFO(keep)
+	}
+
 	if s.policy == ClearOnFull {
 		victims := make([]*entry[K, V], 0, len(s.items)-1)
 		for _, e := range s.items {
@@ -282,10 +317,14 @@ func (s *shard[K, V]) over() bool {
 		(s.maxEntries > 0 && len(s.items) > s.maxEntries)
 }
 
-// remove unlinks e from both the map and the LRU list. Callers hold the lock.
+// remove unlinks e from both the map and its list. Callers hold the lock.
 func (s *shard[K, V]) remove(e *entry[K, V]) {
 	delete(s.items, e.key)
-	s.unlink(e)
+	if e.small {
+		s.unlinkSmall(e)
+	} else {
+		s.unlink(e)
+	}
 	s.bytes -= e.cost
 }
 
