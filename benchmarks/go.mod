@@ -2,7 +2,7 @@
 // sanecache itself keeps its promise of no dependencies.
 module github.com/andared/sanecache/benchmarks
 
-go 1.24.0
+go 1.25.0
 
 replace github.com/andared/sanecache => ../
 

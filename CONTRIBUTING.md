@@ -34,7 +34,7 @@ make cover         # coverage report
 compares against live in `benchmarks/`, which is its own module for exactly that
 reason.
 
-Requires Go 1.24 or newer, which is also what CI tests against alongside the
+Requires Go 1.25 or newer, which is also what CI tests against alongside the
 current release.
 
 ## Pull requests

@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -412,20 +413,20 @@ func TestDivideBudget(t *testing.T) {
 }
 
 func TestBackgroundSweeperRuns(t *testing.T) {
-	c := New(Options[string, int]{TTL: 10 * time.Millisecond, CleanupInterval: time.Millisecond})
-	defer c.Close()
+	synctest.Test(t, func(t *testing.T) {
+		c := New(Options[string, int]{TTL: 10 * time.Millisecond, CleanupInterval: time.Millisecond})
+		defer c.Close()
 
-	if err := c.Set("a", 1); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
+		if err := c.Set("a", 1); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for c.Len() != 0 {
-		if time.Now().After(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		synctest.Wait()
+		if c.Len() != 0 {
 			t.Fatal("sweeper did not drop the expired entry")
 		}
-		time.Sleep(time.Millisecond)
-	}
+	})
 }
 
 func TestCloseIsIdempotentAndLeavesTheCacheUsable(t *testing.T) {
@@ -541,51 +542,54 @@ func TestClearOnFullCountsAnExpirationOnce(t *testing.T) {
 }
 
 func TestCoarseClockExpiresEntries(t *testing.T) {
-	c := New(Options[string, int]{
-		ClockGranularity: time.Millisecond,
-		DisableCleanup:   true,
-	})
-	defer c.Close()
+	synctest.Test(t, func(t *testing.T) {
+		c := New(Options[string, int]{
+			ClockGranularity: time.Millisecond,
+			DisableCleanup:   true,
+		})
+		defer c.Close()
 
-	if err := c.SetTTL("a", 1, 10*time.Millisecond); err != nil {
-		t.Fatalf("SetTTL: %v", err)
-	}
-	// The clock is seeded at construction: a cache whose coarse time started at
-	// the epoch would report everything as expired on the first lookup.
-	if _, ok := c.Get("a"); !ok {
-		t.Fatal("entry expired immediately under a coarse clock")
-	}
+		if err := c.SetTTL("a", 1, 10*time.Millisecond); err != nil {
+			t.Fatalf("SetTTL: %v", err)
+		}
+		// The clock is seeded at construction: a cache whose coarse time started
+		// at the epoch would report everything as expired on the first lookup.
+		if _, ok := c.Get("a"); !ok {
+			t.Fatal("entry expired immediately under a coarse clock")
+		}
 
-	waitFor(t, "the coarse clock to pass the TTL", func() bool {
-		_, ok := c.Get("a")
-
-		return !ok
+		time.Sleep(10 * time.Millisecond)
+		synctest.Wait()
+		if _, ok := c.Get("a"); ok {
+			t.Fatal("the coarse clock did not pass the TTL")
+		}
 	})
 }
 
 // TestCoarseClockStopsWithTheCache: a stopped clock that stayed authoritative
 // would freeze time, and nothing would ever expire again.
 func TestCoarseClockStopsWithTheCache(t *testing.T) {
-	c := New(Options[string, int]{
-		ClockGranularity: time.Hour,
-		DisableCleanup:   true,
-	})
+	synctest.Test(t, func(t *testing.T) {
+		c := New(Options[string, int]{
+			ClockGranularity: time.Hour,
+			DisableCleanup:   true,
+		})
 
-	if err := c.SetTTL("a", 1, time.Millisecond); err != nil {
-		t.Fatalf("SetTTL: %v", err)
-	}
-	time.Sleep(5 * time.Millisecond)
-	// An hour of granularity means the clock has not moved, so the entry is
-	// still inside its TTL as far as this cache is concerned.
-	if _, ok := c.Get("a"); !ok {
-		t.Fatal("lookups are reading the wall clock, not the coarse one")
-	}
+		if err := c.SetTTL("a", 1, time.Millisecond); err != nil {
+			t.Fatalf("SetTTL: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+		// An hour of granularity means the clock has not moved, so the entry is
+		// still inside its TTL as far as this cache is concerned.
+		if _, ok := c.Get("a"); !ok {
+			t.Fatal("lookups are reading the wall clock, not the coarse one")
+		}
 
-	c.Close()
-	waitFor(t, "lookups to fall back to the wall clock", func() bool {
-		_, ok := c.Get("a")
-
-		return !ok
+		c.Close()
+		synctest.Wait()
+		if _, ok := c.Get("a"); ok {
+			t.Fatal("lookups did not fall back to the wall clock")
+		}
 	})
 }
 
