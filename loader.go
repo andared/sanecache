@@ -245,11 +245,11 @@ func (c *core[K, V]) run(
 	defer s.endLoad(key, cl.token)
 	g.run(key, cl, func() (V, error) {
 		v, cost, err := loader(ctx, key)
-		if cost < 0 {
-			cost = c.valueCost(v)
-		}
 		switch {
 		case err == nil:
+			if cost < 0 {
+				cost = c.valueCost(v)
+			}
 			_ = c.setValue(key, v, cost, c.ttl, c.refreshAfter, refreshCache, cl.token)
 		case errors.Is(err, ErrNotFound):
 			_ = c.setNegative(key, c.negativeTTL, cl.token)
