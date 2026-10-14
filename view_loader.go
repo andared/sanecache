@@ -160,11 +160,11 @@ func (v *View[T]) run(
 	defer s.endLoad(fullKey, cl.token)
 	g.run(key, cl, func() (T, error) {
 		value, cost, err := loader(ctx, key)
-		if cost < 0 {
-			cost = v.valueCost(value)
-		}
 		switch {
 		case err == nil:
+			if cost < 0 {
+				cost = v.valueCost(value)
+			}
 			_ = c.setValue(fullKey, value, cost, v.ttl, v.refreshAfter, refreshView, cl.token)
 		case errors.Is(err, ErrNotFound):
 			_ = c.setNegative(fullKey, v.negativeTTL, cl.token)

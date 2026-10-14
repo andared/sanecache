@@ -89,3 +89,32 @@ func TestViewGetOrLoadFuncWithCost(t *testing.T) {
 		t.Fatalf("disabled view: %d, %v", got, err)
 	}
 }
+
+// TestCostIsNotAskedAboutAFailedLoad: a failed load has no value to measure, and
+// a Cost that reads through a nil pointer must not turn the failure into a panic.
+func TestCostIsNotAskedAboutAFailedLoad(t *testing.T) {
+	type doc struct{ body string }
+	cost := func(d *doc) int64 { return int64(len(d.body)) }
+	fail := func(_ context.Context, key string) (*doc, error) {
+		if key == "gone" {
+			return nil, ErrNotFound
+		}
+
+		return nil, errUpstream
+	}
+
+	c := New(Options[string, *doc]{MaxBytes: 100, Cost: cost, NegativeTTL: time.Minute, Loader: fail})
+	defer c.Close()
+	a := New(Options[string, any]{MaxBytes: 100, Cost: func(any) int64 { return 1 }, NegativeTTL: time.Minute})
+	defer a.Close()
+	v := NewView(a, ViewOptions[*doc]{Name: "d", Cost: cost, Loader: fail})
+
+	for _, key := range []string{"gone", "down"} {
+		if _, err := c.GetOrLoad(context.Background(), key); err == nil {
+			t.Fatalf("cache %s: no error", key)
+		}
+		if _, err := v.GetOrLoad(context.Background(), key); err == nil {
+			t.Fatalf("view %s: no error", key)
+		}
+	}
+}

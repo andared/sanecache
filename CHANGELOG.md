@@ -17,6 +17,11 @@ While the major version is 0, the public API may change in any release.
   `GetOrLoad` through the batch loader when there is no `Loader`, due keys refreshed in one
   call. `ViewStats.Batches` counts the calls.
 
+### Fixed
+
+- A failed load no longer has its zero value passed to `Cost`, which since 0.8.0 turned a
+  `Cost` that reads through a nil pointer into a loader panic.
+
 ### Changed
 
 - Requires Go 1.25, for `testing/synctest` in the tests; Go 1.24 is past its support window.
