@@ -6,6 +6,8 @@ While the major version is 0, the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-14
+
 ### Added
 
 - `Cache.All` and `View.All`: iterators over the cached values, for dumping a cache or
@@ -234,7 +236,8 @@ First cut.
 - Built-in counters via `Stats`, and an `OnEvict` callback carrying a reason.
 - `ErrTooLarge` from `Set` for values that can never fit.
 
-[Unreleased]: https://github.com/andared/sanecache/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/andared/sanecache/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/andared/sanecache/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/andared/sanecache/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/andared/sanecache/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/andared/sanecache/compare/v0.5.0...v0.6.0
