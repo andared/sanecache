@@ -1,6 +1,6 @@
 # Runnable examples
 
-Requires Go 1.24 or newer. Run these commands from the repository root:
+Requires Go 1.25 or newer. Run these commands from the repository root:
 
 ```sh
 go run ./examples/basic

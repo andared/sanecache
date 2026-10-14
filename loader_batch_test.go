@@ -323,6 +323,33 @@ func TestBatchAndSingleLoadsShareFlights(t *testing.T) {
 	}
 }
 
+// TestBatchRechecksTheCacheBeforeStartingOver is TestLoadRechecksTheCacheBeforeStartingOver
+// for a batch: keys answered between the caller's lookups and acquire are served,
+// not loaded again. acquire is entered directly for the same reason.
+func TestBatchRechecksTheCacheBeforeStartingOver(t *testing.T) {
+	r := newBatchRecorder(map[string]int{"k": 1, "gone": 2}, false)
+	c := New(Options[string, int]{TTL: time.Minute, NegativeTTL: time.Minute, BatchLoader: r.load})
+	defer c.Close()
+
+	if err := c.Set("k", 7); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := c.SetNegative("gone"); err != nil {
+		t.Fatalf("SetNegative: %v", err)
+	}
+	found := make(map[string]int)
+	waits, fresh, batch := c.core.acquire(context.Background(), []string{"k", "gone"}, found)
+	if len(waits) != 0 || len(fresh) != 0 || batch != nil {
+		t.Fatalf("acquire started loads: %d waits, %d fresh", len(waits), len(fresh))
+	}
+	if !maps.Equal(found, map[string]int{"k": 7}) {
+		t.Fatalf("found = %v; want only k", found)
+	}
+	if got := c.Stats().Coalesced; got != 2 {
+		t.Fatalf("Coalesced = %d; want 2", got)
+	}
+}
+
 // TestDeleteDuringBatchKeepsOnlyThatKeyOut: invalidation is per key, not per
 // batch, exactly as it is per load for GetOrLoad.
 func TestDeleteDuringBatchKeepsOnlyThatKeyOut(t *testing.T) {

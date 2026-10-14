@@ -16,7 +16,7 @@ millisecond, and a cold key that a hundred concurrent requests each fetch for th
 import "github.com/andared/sanecache"
 ```
 
-Requires Go 1.24. No dependencies.
+Requires Go 1.25. No dependencies.
 
 ## Quick start
 

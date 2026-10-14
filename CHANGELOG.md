@@ -6,6 +6,10 @@ While the major version is 0, the public API may change in any release.
 
 ## [Unreleased]
 
+### Changed
+
+- Requires Go 1.25, for `testing/synctest` in the tests; Go 1.24 is past its support window.
+
 ## [0.8.0] - 2026-10-09
 
 ### Added
