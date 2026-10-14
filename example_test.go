@@ -96,6 +96,27 @@ func ExampleCache_Set() {
 	// cached: false rejections: 1
 }
 
+// All carries what a cache holds into another one, here with a larger budget,
+// or out to wherever a warm start is read back from.
+func ExampleCache_All() {
+	old := sanecache.New(sanecache.Options[string, int]{MaxEntries: 100})
+	defer old.Close()
+	_ = old.Set("a", 1)
+	_ = old.Set("b", 2)
+
+	bigger := sanecache.New(sanecache.Options[string, int]{MaxEntries: 1000})
+	defer bigger.Close()
+	for k, v := range old.All() {
+		_ = bigger.Set(k, v)
+	}
+
+	v, _ := bigger.Get("b")
+	fmt.Println(bigger.Len(), v)
+
+	// Output:
+	// 2 2
+}
+
 func ExampleCache_Stats() {
 	c := sanecache.New(sanecache.Options[int, string]{
 		TTL:         time.Minute,
